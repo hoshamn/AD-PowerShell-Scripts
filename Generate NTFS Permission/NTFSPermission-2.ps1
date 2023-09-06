@@ -1,0 +1,1 @@
+get-childitem "C:\" -recurse | Get-Acl | Format-Table -Wrap | Out-File -FilePath C:\Result.txt

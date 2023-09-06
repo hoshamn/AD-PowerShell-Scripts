@@ -1,0 +1,15 @@
+Steps:
+
+New-ADUser "aaa@nourlabs.com"
+New-ADUser "aaa@abcd.com"
+
+Get-ADUser aaa@nourlabs.com | Set-ADUser -UserPrincipalName "aaa@nourlabs.com" -SamAccountName "aaa#nourlabs.com" 
+Get-ADUser aaa@abcd.com | Set-ADUser -UserPrincipalName "aaa@contact.nourlabs.com" -SamAccountName "aaa#nourlabs" -Add @{extensionAttribute1="contact.nourlabs.com"}
+
+
+Enable-Mailbox -Identity "aaa@nourlabs.com"
+Enable-Mailbox  aaa#nourlabs -Alias "aaa"
+
+
+
+MG
