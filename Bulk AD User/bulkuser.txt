@@ -1,0 +1,4 @@
+Import-Csv .\bulkusers.csv | foreach-object { 
+$userprinicpalname = $_.SamAccountName + "@ksue15.local" 
+New-ADUser -SamAccountName $_.SamAccountName -Name $_.name -DisplayName $_.name -GivenName $_.cn -Department $_.Department -AccountPassword (ConvertTo-SecureString "P@ssw0rd" -AsPlainText -force) -Enabled $True -PasswordNeverExpires $True -PassThru }
+

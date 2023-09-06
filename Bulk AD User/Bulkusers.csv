@@ -1,0 +1,16 @@
+name,SamAccountName,cn,password,Department,Company
+salt01,salt01,salt01,UserP@ssw0rd,IT,Salt
+salt02,salt02,salt02,UserP@ssw0rd,Sales,Salt
+salt03,salt03,salt03,UserP@ssw0rd,Marketing,Salt
+salt04,salt04,salt04,UserP@ssw0rd,Reception,Salt
+salt05,salt05,salt05,UserP@ssw0rd,Finance,Salt
+salt06,salt06,salt06,UserP@ssw0rd,Development,Salt
+salt07,salt07,salt07,UserP@ssw0rd,recearch,Salt
+salt08,salt08,salt08,UserP@ssw0rd,laundry,Salt
+salt09,salt09,salt09,UserP@ssw0rd,IT,Salt
+salt10,salt10,salt10,UserP@ssw0rd,Sales,Salt
+salt11,salt11,salt11,UserP@ssw0rd,Marketing,Salt
+salt12,salt12,salt12,UserP@ssw0rd,Reception,Salt
+salt13,salt13,salt13,UserP@ssw0rd,IT,Salt
+salt14,salt14,salt14,UserP@ssw0rd,Sales,Salt
+salt15,salt15,salt15,UserP@ssw0rd,Marketing,Salt
