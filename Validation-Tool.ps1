@@ -206,11 +206,17 @@ function Test-ADPermissions {
                 CanReadGPO = $false
                 CanReadReplication = $false
                 Groups = @()
+                UserIdentity = $null
             }
             
             try {
                 Import-Module ActiveDirectory -ErrorAction Stop
                 
+                # Get current user identity
+                $CurrentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+                $PermissionResults.UserIdentity = $CurrentUser.Name
+                
+                # TEST 1: Can read AD users
                 try {
                     Get-ADUser -Filter * -ResultSetSize 1 -ErrorAction Stop | Out-Null
                     $PermissionResults.CanReadAD = $true
@@ -219,6 +225,7 @@ function Test-ADPermissions {
                     $PermissionResults.CanReadAD = $false
                 }
                 
+                # TEST 2: Can read GPOs
                 try {
                     Get-GPO -All -ErrorAction Stop | Select-Object -First 1 | Out-Null
                     $PermissionResults.CanReadGPO = $true
@@ -227,6 +234,7 @@ function Test-ADPermissions {
                     $PermissionResults.CanReadGPO = $false
                 }
                 
+                # TEST 3: Can read replication
                 try {
                     Get-ADReplicationPartnerMetadata -Target $env:COMPUTERNAME -Scope Server -ErrorAction Stop | Out-Null
                     $PermissionResults.CanReadReplication = $true
@@ -235,22 +243,15 @@ function Test-ADPermissions {
                     $PermissionResults.CanReadReplication = $false
                 }
                 
-                $CurrentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+                # TEST 4: Check group membership via SID
+                $DomainAdminSID = $CurrentUser.Groups | Where-Object { $_.Value -like "S-1-5-21-*-512" }
+                if ($DomainAdminSID) {
+                    $PermissionResults.Groups += "Domain Admins"
+                }
                 
-                $AdminGroups = @("Domain Admins", "Enterprise Admins", "Administrators")
-                
-                foreach ($GroupName in $AdminGroups) {
-                    try {
-                        $GroupObj = Get-ADGroup -Filter {Name -eq $GroupName} -ErrorAction SilentlyContinue
-                        if ($GroupObj) {
-                            $IsMember = Get-ADGroupMember -Identity $GroupObj -Recursive -ErrorAction SilentlyContinue | 
-                                Where-Object { $_.SamAccountName -eq $CurrentUser.Name.Split('\')[-1] }
-                            if ($IsMember) {
-                                $PermissionResults.Groups += $GroupName
-                            }
-                        }
-                    }
-                    catch {}
+                $EnterpriseAdminSID = $CurrentUser.Groups | Where-Object { $_.Value -like "S-1-5-21-*-519" }
+                if ($EnterpriseAdminSID) {
+                    $PermissionResults.Groups += "Enterprise Admins"
                 }
                 
             }
@@ -266,30 +267,28 @@ function Test-ADPermissions {
         if ($PermCheck.Success -and $PermCheck.Data) {
             $Data = $PermCheck.Data
             
-            # STRICT REQUIREMENT: Must be in Domain Admins or Enterprise Admins
-            $HasRequiredGroup = $false
-            $RequiredGroups = @("Domain Admins", "Enterprise Admins")
+            $Results.Details += "[INFO] Running as: $($Data.UserIdentity)"
             
-            # Check if user is in ANY of the required groups
-            foreach ($GroupName in $RequiredGroups) {
-                if ($Data.Groups -contains $GroupName) {
-                    $HasRequiredGroup = $true
-                    $Results.Details += "[OK] Member of $GroupName"
-                    break
-                }
+            # DECISION: Must have required group OR all capabilities
+            $HasRequiredGroup = ($Data.Groups -contains "Domain Admins") -or 
+                               ($Data.Groups -contains "Enterprise Admins")
+            
+            $HasRequiredCapabilities = $Data.CanReadAD -and $Data.CanReadGPO -and $Data.CanReadReplication
+            
+            if ($HasRequiredGroup) {
+                $Results.Details += "[OK] Member of: $($Data.Groups -join ', ')"
+                $Results.HasPermission = $true
             }
-            
-            # If not in required groups, mark as failed
-            if (-not $HasRequiredGroup) {
+            elseif ($HasRequiredCapabilities) {
+                $Results.Details += "[OK] Has functional permissions (can perform all operations)"
+                $Results.HasPermission = $true
+            }
+            else {
                 $Results.MissingPermissions += "NOT a member of Domain Admins or Enterprise Admins"
-                if ($Data.Groups.Count -gt 0) {
-                    $Results.Details += "[FAIL] User groups: $($Data.Groups -join ', ') - NONE are sufficient"
-                } else {
-                    $Results.Details += "[FAIL] User is not in any required admin groups"
-                }
+                $Results.HasPermission = $false
             }
             
-            # Check capabilities (informational only - don't affect final decision)
+            # Capability details
             if ($Data.CanReadAD) {
                 $Results.Details += "[OK] Can read Active Directory objects"
             } else {
@@ -308,12 +307,9 @@ function Test-ADPermissions {
                 $Results.MissingPermissions += "Cannot read Replication data"
             }
             
-            # FINAL DECISION: Group membership is the ONLY requirement
-            $Results.HasPermission = $HasRequiredGroup
-            
             if (-not $Results.HasPermission) {
                 $Results.Details += ""
-                $Results.Details += "BLOCKED: Must be member of Domain Admins or Enterprise Admins group"
+                $Results.Details += "REQUIREMENT: Must be Domain Admins/Enterprise Admins OR have equivalent permissions"
             }
         }
         else {
@@ -351,79 +347,173 @@ function Test-ExchangePermissions {
             return $Results
         }
         
-        $Session = Connect-ExchangeRemote -ServerName $ServerName -Credential $Credential
+        $Session = $null
+        try {
+            $Session = Connect-ExchangeRemote -ServerName $ServerName -Credential $Credential
+        }
+        catch {
+            $Results.MissingPermissions += "Cannot establish Exchange PowerShell session - Access Denied"
+            $Results.Details += "[FAIL] No Exchange permissions"
+            return $Results
+        }
         
         if (-not $Session) {
-            $Results.MissingPermissions += "Cannot establish Exchange PowerShell session"
+            $Results.MissingPermissions += "Exchange session failed - Access Denied"
             return $Results
         }
         
         try {
-            # Check Exchange Role Group Membership FIRST
-            $RequiredRoles = @("Organization Management", "View-Only Organization Management")
-            $UserRoles = @()
+            # FIXED: Handle both formats - domain\username and username@domain.com
+            $CurrentUserName = $Credential.UserName
+            
+            # Extract just the username from different formats
+            if ($CurrentUserName -match '@') {
+                # Format: handover@nourtest.com
+                $CurrentUserName = $CurrentUserName.Split('@')[0]
+            }
+            elseif ($CurrentUserName -match '\\') {
+                # Format: DOMAIN\handover
+                $CurrentUserName = $CurrentUserName.Split('\')[-1]
+            }
+            
+            $Results.Details += "[INFO] Checking permissions for user: $CurrentUserName"
+            
             $HasRequiredRole = $false
+            $UserRoles = @()
             
             try {
-                $CurrentUserName = $Credential.UserName.Split('\')[-1]
-                $RoleGroups = Get-RoleGroup -ErrorAction SilentlyContinue
+                # Check Organization Management membership
+                $OrgMgmtMembers = Get-RoleGroupMember -Identity "Organization Management" -ErrorAction Stop
                 
-                foreach ($RoleGroup in $RoleGroups) {
-                    $Members = Get-RoleGroupMember -Identity $RoleGroup.Name -ErrorAction SilentlyContinue
-                    foreach ($Member in $Members) {
-                        if ($Member.SamAccountName -eq $CurrentUserName) {
-                            $UserRoles += $RoleGroup.Name
-                            if ($RequiredRoles -contains $RoleGroup.Name) {
-                                $HasRequiredRole = $true
-                            }
+                $Results.Details += "[INFO] Found $($OrgMgmtMembers.Count) members in Organization Management"
+                
+                foreach ($Member in $OrgMgmtMembers) {
+                    # Check multiple properties to match the user
+                    $MemberMatch = ($Member.SamAccountName -eq $CurrentUserName) -or 
+                                   ($Member.Name -eq $CurrentUserName) -or
+                                   ($Member.Alias -eq $CurrentUserName) -or
+                                   ($Member.PrimarySmtpAddress -like "$CurrentUserName@*")
+                    
+                    if ($MemberMatch) {
+                        $HasRequiredRole = $true
+                        $UserRoles += "Organization Management"
+                        $Results.Details += "[FOUND] Matched as: $($Member.Name) (SamAccountName: $($Member.SamAccountName))"
+                        break
+                    }
+                }
+            }
+            catch {
+                $Results.Details += "[ERROR] Cannot query Organization Management group: $($_.Exception.Message)"
+            }
+            
+            # Check View-Only as alternative
+            if (-not $HasRequiredRole) {
+                try {
+                    $ViewOnlyMembers = Get-RoleGroupMember -Identity "View-Only Organization Management" -ErrorAction SilentlyContinue
+                    
+                    foreach ($Member in $ViewOnlyMembers) {
+                        $MemberMatch = ($Member.SamAccountName -eq $CurrentUserName) -or 
+                                       ($Member.Name -eq $CurrentUserName) -or
+                                       ($Member.Alias -eq $CurrentUserName) -or
+                                       ($Member.PrimarySmtpAddress -like "$CurrentUserName@*")
+                        
+                        if ($MemberMatch) {
+                            $HasRequiredRole = $true
+                            $UserRoles += "View-Only Organization Management"
+                            $Results.Details += "[FOUND] Matched in View-Only as: $($Member.Name)"
+                            break
                         }
                     }
                 }
+                catch {}
+            }
+            
+            if ($HasRequiredRole) {
+                $Results.Details += "[PASS] Member of: $($UserRoles -join ', ')"
+                $Results.HasPermission = $true
                 
-                if ($HasRequiredRole) {
-                    $Results.Details += "[OK] Member of required Exchange role: $($UserRoles -join ', ')"
-                } else {
-                    $Results.MissingPermissions += "NOT a member of Organization Management"
-                    if ($UserRoles.Count -gt 0) {
-                        $Results.Details += "[INFO] User roles found: $($UserRoles -join ', ')"
-                    } else {
-                        $Results.Details += "[FAIL] User has no Exchange role group memberships"
+                # Add additional success details like AD does
+                $Results.Details += ""
+                $Results.Details += "CAPABILITIES VERIFIED:"
+                $Results.Details += "=" * 60
+                
+                # Test Exchange cmdlet access
+                try {
+                    Get-ExchangeServer -ErrorAction Stop | Select-Object -First 1 | Out-Null
+                    $Results.Details += "[OK] Can read Exchange Server configuration"
+                }
+                catch {
+                    $Results.Details += "[WARNING] Cannot read Exchange Server configuration"
+                }
+                
+                try {
+                    Get-MailboxDatabase -ErrorAction Stop | Select-Object -First 1 | Out-Null
+                    $Results.Details += "[OK] Can read Mailbox Databases"
+                }
+                catch {
+                    $Results.Details += "[WARNING] Cannot read Mailbox Databases"
+                }
+                
+                try {
+                    Get-AcceptedDomain -ErrorAction Stop | Select-Object -First 1 | Out-Null
+                    $Results.Details += "[OK] Can read Accepted Domains"
+                }
+                catch {
+                    $Results.Details += "[WARNING] Cannot read Accepted Domains"
+                }
+                
+                try {
+                    Get-TransportConfig -ErrorAction SilentlyContinue | Out-Null
+                    $Results.Details += "[OK] Can read Transport Configuration"
+                }
+                catch {
+                    $Results.Details += "[WARNING] Cannot read Transport Configuration"
+                }
+                
+                $Results.Details += ""
+                $Results.Details += "======================================================================"
+                $Results.Details += "PERMISSION CHECK PASSED - Ready to proceed with validation"
+                $Results.Details += "======================================================================"
+            } 
+            else {
+                # Show what roles user IS in
+                try {
+                    $AllRoleGroups = Get-RoleGroup -ErrorAction SilentlyContinue
+                    $UserActualRoles = @()
+                    
+                    foreach ($RoleGroup in $AllRoleGroups) {
+                        $RoleMembers = Get-RoleGroupMember -Identity $RoleGroup.Name -ErrorAction SilentlyContinue
+                        foreach ($Member in $RoleMembers) {
+                            $MemberMatch = ($Member.SamAccountName -eq $CurrentUserName) -or 
+                                           ($Member.Name -eq $CurrentUserName) -or
+                                           ($Member.Alias -eq $CurrentUserName)
+                            
+                            if ($MemberMatch) {
+                                $UserActualRoles += $RoleGroup.Name
+                            }
+                        }
+                    }
+                    
+                    if ($UserActualRoles.Count -gt 0) {
+                        $Results.Details += "[INFO] User is in these Exchange roles: $($UserActualRoles -join ', ')"
+                        $Results.Details += "[FAIL] NONE of these roles are sufficient for validation"
+                    } 
+                    else {
+                        $Results.Details += "[FAIL] User has NO Exchange role group memberships"
                     }
                 }
+                catch {}
+                
+                $Results.MissingPermissions += "NOT a member of Organization Management or View-Only Organization Management"
+                $Results.HasPermission = $false
             }
-            catch {
-                $Results.MissingPermissions += "Cannot verify Exchange role group membership"
-                $HasRequiredRole = $false
-            }
-            
-            $PermTests = @{
-                CanReadServers = $false
-                CanReadDatabases = $false
-            }
-            
-            try {
-                Get-ExchangeServer -ErrorAction Stop | Select-Object -First 1 | Out-Null
-                $PermTests.CanReadServers = $true
-                $Results.Details += "[OK] Can read Exchange Server configuration"
-            }
-            catch {
-                $Results.MissingPermissions += "Cannot read Exchange Server configuration"
-            }
-            
-            try {
-                Get-MailboxDatabase -ErrorAction Stop | Select-Object -First 1 | Out-Null
-                $PermTests.CanReadDatabases = $true
-                $Results.Details += "[OK] Can read Mailbox Databases"
-            }
-            catch {
-                $Results.MissingPermissions += "Cannot read Mailbox Databases"
-            }
-            
-            $Results.HasPermission = $HasRequiredRole -and $PermTests.CanReadServers -and $PermTests.CanReadDatabases
             
             if (-not $Results.HasPermission) {
                 $Results.Details += ""
-                $Results.Details += "REQUIREMENT: Must be Organization Management or View-Only Organization Management"
+                $Results.Details += "======================================================================"
+                $Results.Details += "BLOCKED: MUST be member of 'Organization Management' group"
+                $Results.Details += "======================================================================"
+                $Results.Details += "Validation CANNOT proceed without this role membership"
             }
         }
         finally {
@@ -432,11 +522,11 @@ function Test-ExchangePermissions {
     }
     catch {
         $Results.MissingPermissions += "Error: $($_.Exception.Message)"
+        $Results.HasPermission = $false
     }
     
     return $Results
 }
-
 function Test-ADFSPermissions {
     param([System.Management.Automation.PSCredential]$Credential)
     
@@ -466,9 +556,30 @@ function Test-ADFSPermissions {
                 CanReadADFS = $false
                 CanReadService = $false
                 IsLocalAdmin = $false
+                IsDomainAdmin = $false
+                UserGroups = @()
             }
             
             try {
+                $CurrentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+                $UserPrincipal = New-Object System.Security.Principal.WindowsPrincipal($CurrentUser)
+                
+                # Check local admin
+                $AdminRole = [System.Security.Principal.WindowsBuiltInRole]::Administrator
+                $PermissionResults.IsLocalAdmin = $UserPrincipal.IsInRole($AdminRole)
+                
+                # Check Domain Admin via SID
+                $DomainAdminSID = $CurrentUser.Groups | Where-Object { $_.Value -like "S-1-5-21-*-512" }
+                if ($DomainAdminSID) {
+                    $PermissionResults.IsDomainAdmin = $true
+                    $PermissionResults.UserGroups += "Domain Admins"
+                }
+                
+                $EnterpriseAdminSID = $CurrentUser.Groups | Where-Object { $_.Value -like "S-1-5-21-*-519" }
+                if ($EnterpriseAdminSID) {
+                    $PermissionResults.UserGroups += "Enterprise Admins"
+                }
+                
                 try {
                     Import-Module ADFS -ErrorAction Stop
                     $PermissionResults.CanReadADFS = $true
@@ -484,11 +595,6 @@ function Test-ADFSPermissions {
                 catch {
                     $PermissionResults.CanReadService = $false
                 }
-                
-                $CurrentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-                $UserPrincipal = New-Object System.Security.Principal.WindowsPrincipal($CurrentUser)
-                $AdminRole = [System.Security.Principal.WindowsBuiltInRole]::Administrator
-                $PermissionResults.IsLocalAdmin = $UserPrincipal.IsInRole($AdminRole)
             }
             catch {
                 $PermissionResults.Error = $_.Exception.Message
@@ -502,15 +608,20 @@ function Test-ADFSPermissions {
         if ($PermCheck.Success -and $PermCheck.Data) {
             $Data = $PermCheck.Data
             
-            # PRIMARY REQUIREMENT: Must be Local Administrator
+            if ($Data.IsDomainAdmin) {
+                $Results.Details += "[OK] User is Domain Admin"
+            }
+            
+            if ($Data.UserGroups.Count -gt 0) {
+                $Results.Details += "[INFO] Member of: $($Data.UserGroups -join ', ')"
+            }
+            
             if ($Data.IsLocalAdmin) {
                 $Results.Details += "[OK] Has Local Administrator rights"
             } else {
                 $Results.MissingPermissions += "NOT a Local Administrator on ADFS server"
-                $Results.Details += "[FAIL] Local Administrator rights REQUIRED"
             }
             
-            # Secondary checks (informational only)
             if ($Data.CanReadADFS) {
                 $Results.Details += "[OK] Can access ADFS module"
             } else {
@@ -523,12 +634,11 @@ function Test-ADFSPermissions {
                 $Results.MissingPermissions += "Cannot read ADFS Service"
             }
             
-            # FINAL DECISION: Local Admin is MANDATORY
             $Results.HasPermission = $Data.IsLocalAdmin
             
             if (-not $Results.HasPermission) {
                 $Results.Details += ""
-                $Results.Details += "BLOCKED: Must have Local Administrator rights on ADFS servers"
+                $Results.Details += "BLOCKED: Local Administrator rights required"
             }
         }
         else {
@@ -575,7 +685,7 @@ function Show-PermissionCheckDialog {
     }
     else {
         $StatusPanel.BackColor = [System.Drawing.Color]::FromArgb(248, 215, 218)
-        $StatusText = "[FAIL] INSUFFICIENT PERMISSIONS"
+        $StatusText = "[FAIL] INSUFFICIENT PERMISSIONS - ACCESS DENIED"
         $StatusColor = [System.Drawing.Color]::FromArgb(231, 76, 60)
     }
     
@@ -623,6 +733,7 @@ function Show-PermissionCheckDialog {
     $ButtonPanel.Size = New-Object System.Drawing.Size(660, 50)
     $ButtonPanel.FlowDirection = [System.Windows.Forms.FlowDirection]::RightToLeft
     
+    # ONLY show Continue button if permissions are OK
     if ($PermissionResults.HasPermission) {
         $ContinueButton = New-Object System.Windows.Forms.Button
         $ContinueButton.Text = "Continue with Validation"
@@ -635,9 +746,21 @@ function Show-PermissionCheckDialog {
         $ButtonPanel.Controls.Add($ContinueButton)
         $DialogForm.AcceptButton = $ContinueButton
     }
+    else {
+        # Show DISABLED Continue button to make it clear user cannot proceed
+        $DisabledButton = New-Object System.Windows.Forms.Button
+        $DisabledButton.Text = "Continue (BLOCKED)"
+        $DisabledButton.Size = New-Object System.Drawing.Size(200, 40)
+        $DisabledButton.BackColor = [System.Drawing.Color]::FromArgb(149, 165, 166)
+        $DisabledButton.ForeColor = [System.Drawing.Color]::White
+        $DisabledButton.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+        $DisabledButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+        $DisabledButton.Enabled = $false  # DISABLED
+        $ButtonPanel.Controls.Add($DisabledButton)
+    }
     
     $CancelButton = New-Object System.Windows.Forms.Button
-    $CancelButton.Text = "Cancel"
+    $CancelButton.Text = "Close"
     $CancelButton.Size = New-Object System.Drawing.Size(100, 40)
     $CancelButton.BackColor = [System.Drawing.Color]::FromArgb(149, 165, 166)
     $CancelButton.ForeColor = [System.Drawing.Color]::White
@@ -650,7 +773,9 @@ function Show-PermissionCheckDialog {
     $DialogForm.Controls.Add($ButtonPanel)
     
     $Result = $DialogForm.ShowDialog()
-    return ($Result -eq [System.Windows.Forms.DialogResult]::OK)
+    
+    # Return true ONLY if user has permissions AND clicked continue
+    return ($PermissionResults.HasPermission -and $Result -eq [System.Windows.Forms.DialogResult]::OK)
 }
 
 
@@ -2859,20 +2984,16 @@ function Show-ExchangeResults {
         return
     }
     
-    # CHECK PERMISSIONS FIRST - MANDATORY
+    # CHECK PERMISSIONS FIRST - STRICT ENFORCEMENT
     Update-Status "Checking Exchange permissions..."
     $PermCheck = Test-ExchangePermissions -Credential $Script:Credential
     
-    # Block execution if no permissions
     if (-not $PermCheck.HasPermission) {
-        $ErrorDetails = "Missing Permissions:`n"
-        foreach ($Missing in $PermCheck.MissingPermissions) {
-            $ErrorDetails += "- $Missing`n"
-        }
+        Show-PermissionCheckDialog -ValidationType "Exchange Server" -PermissionResults $PermCheck
         
         [System.Windows.Forms.MessageBox]::Show(
-            "PERMISSION DENIED`n`nYou do not have the required permissions to run Exchange validation.`n`n$ErrorDetails`nValidation cannot proceed.",
-            "Insufficient Permissions",
+            "VALIDATION BLOCKED`n`nInsufficient Permissions`n`nREQUIRED: Organization Management group membership`n`nValidation cannot proceed.",
+            "Access Denied",
             "OK",
             "Error"
         )
@@ -2880,13 +3001,7 @@ function Show-ExchangeResults {
         return
     }
     
-    # Show what permissions were verified
-    $ContinueValidation = Show-PermissionCheckDialog -ValidationType "Exchange Server" -PermissionResults $PermCheck
-    
-    if (-not $ContinueValidation) {
-        Update-Status "Exchange validation cancelled by user"
-        return
-    }
+    Update-Status "Permission check passed - proceeding with Exchange validation..."
     
     $Servers = $Script:ServerInventory | Where-Object { $_.Role -match "Exchange" }
     
@@ -2904,13 +3019,12 @@ function Show-ExchangeResults {
     $Script:CurrentResults.Clear()
 
     Update-ValidationProgress -CurrentStep 1 -StatusText "Preparing Exchange validation..."
-    if ($Servers.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show("No Exchange servers found", "Info", "OK", "Information")
-        return
-    }
+    
+    # Clear existing tabs
     while ($Global:TabControl.TabPages.Count -gt 1) {
         $Global:TabControl.TabPages.RemoveAt(1)
     }
+    
     $StepCounter = 2
     foreach ($Server in $Servers) {
         $ServerName = $Server.Name
@@ -2921,12 +3035,14 @@ function Show-ExchangeResults {
         if (Test-ServerConnection -ServerName $ServerName -Credential $Script:Credential) {
             Update-Status "Validating Exchange on $ServerName..."
             $Data = Test-ExchangeComprehensive -ServerName $ServerName -Credential $Script:Credential
+            
             if ($Data) {
                 $TabPage = New-Object System.Windows.Forms.TabPage
                 $TabPage.Text = $ServerName
                 $TabPage.Padding = New-Object System.Windows.Forms.Padding(3)
                 $SubTabControl = New-Object System.Windows.Forms.TabControl
                 $SubTabControl.Dock = [System.Windows.Forms.DockStyle]::Fill
+                
                 if ($Data.ServerInfo.Count -gt 0) {
                     $SvrTab = New-Object System.Windows.Forms.TabPage
                     $SvrTab.Text = "Server Info"
@@ -2935,6 +3051,7 @@ function Show-ExchangeResults {
                     $SvrTab.Controls.Add($SvrGrid)
                     $SubTabControl.TabPages.Add($SvrTab)
                 }
+                
                 if ($Data.DiskInfo.Count -gt 0) {
                     $DiskTab = New-Object System.Windows.Forms.TabPage
                     $DiskTab.Text = "Disk Details"
@@ -2951,6 +3068,7 @@ function Show-ExchangeResults {
                     $DiskTab.Controls.Add($DiskGrid)
                     $SubTabControl.TabPages.Add($DiskTab)
                 }
+                
                 if ($Data.NetworkAdapters.Count -gt 0) {
                     $NetAdapTab = New-Object System.Windows.Forms.TabPage
                     $NetAdapTab.Text = "Network Adapters"
@@ -2959,6 +3077,7 @@ function Show-ExchangeResults {
                     $NetAdapTab.Controls.Add($NetAdapGrid)
                     $SubTabControl.TabPages.Add($NetAdapTab)
                 }
+                
                 if ($Data.WindowsServices.Count -gt 0) {
                     $SvcTab = New-Object System.Windows.Forms.TabPage
                     $SvcTab.Text = "Windows Services"
@@ -2973,6 +3092,7 @@ function Show-ExchangeResults {
                     $SvcTab.Controls.Add($SvcGrid)
                     $SubTabControl.TabPages.Add($SvcTab)
                 }
+                
                 if ($Data.General.Count -gt 0) {
                     $GenTab = New-Object System.Windows.Forms.TabPage
                     $GenTab.Text = "General"
@@ -2981,6 +3101,7 @@ function Show-ExchangeResults {
                     $GenTab.Controls.Add($GenGrid)
                     $SubTabControl.TabPages.Add($GenTab)
                 }
+                
                 if ($Data.AcceptedDomains.Count -gt 0) {
                     $DomTab = New-Object System.Windows.Forms.TabPage
                     $DomTab.Text = "Accepted Domains"
@@ -2994,6 +3115,7 @@ function Show-ExchangeResults {
                     $DomTab.Controls.Add($DomGrid)
                     $SubTabControl.TabPages.Add($DomTab)
                 }
+                
                 if ($Data.MailboxDatabases.Count -gt 0) {
                     $DBTab = New-Object System.Windows.Forms.TabPage
                     $DBTab.Text = "Mailbox Databases"
@@ -3008,6 +3130,7 @@ function Show-ExchangeResults {
                     $DBTab.Controls.Add($DBGrid)
                     $SubTabControl.TabPages.Add($DBTab)
                 }
+                
                 if ($Data.SystemMailboxes.Count -gt 0) {
                     $SysTab = New-Object System.Windows.Forms.TabPage
                     $SysTab.Text = "System Mailboxes"
@@ -3016,6 +3139,7 @@ function Show-ExchangeResults {
                     $SysTab.Controls.Add($SysGrid)
                     $SubTabControl.TabPages.Add($SysTab)
                 }
+                
                 if ($Data.VirtualDirectories.Count -gt 0) {
                     $VDirTab = New-Object System.Windows.Forms.TabPage
                     $VDirTab.Text = "Virtual Directories"
@@ -3030,6 +3154,7 @@ function Show-ExchangeResults {
                     $VDirTab.Controls.Add($VDirGrid)
                     $SubTabControl.TabPages.Add($VDirTab)
                 }
+                
                 if ($Data.Certificates.Count -gt 0) {
                     $CertTab = New-Object System.Windows.Forms.TabPage
                     $CertTab.Text = "SSL Certificates"
@@ -3045,6 +3170,7 @@ function Show-ExchangeResults {
                     $CertTab.Controls.Add($CertGrid)
                     $SubTabControl.TabPages.Add($CertTab)
                 }
+                
                 if ($Data.SendConnectors.Count -gt 0) {
                     $ConnTab = New-Object System.Windows.Forms.TabPage
                     $ConnTab.Text = "Send Connectors"
@@ -3058,6 +3184,7 @@ function Show-ExchangeResults {
                     $ConnTab.Controls.Add($ConnGrid)
                     $SubTabControl.TabPages.Add($ConnTab)
                 }
+                
                 if ($Data.DAG.Count -gt 0) {
                     $DAGTab = New-Object System.Windows.Forms.TabPage
                     $DAGTab.Text = "DAG"
@@ -3066,6 +3193,7 @@ function Show-ExchangeResults {
                     $DAGTab.Controls.Add($DAGGrid)
                     $SubTabControl.TabPages.Add($DAGTab)
                 }
+                
                 if ($Data.InternetAccess.Count -gt 0) {
                     $NetTab = New-Object System.Windows.Forms.TabPage
                     $NetTab.Text = "Internet Access"
@@ -3080,8 +3208,10 @@ function Show-ExchangeResults {
                     $NetTab.Controls.Add($NetGrid)
                     $SubTabControl.TabPages.Add($NetTab)
                 }
+                
                 $TabPage.Controls.Add($SubTabControl)
                 $Global:TabControl.TabPages.Add($TabPage)
+                
                 $Script:CurrentResults[$ServerName] = @{
                     Type = "Exchange"
                     Results = $Data
@@ -3090,9 +3220,11 @@ function Show-ExchangeResults {
             }
         }
     }
+    
     Complete-ValidationProgress -CompletionMessage "Exchange validation completed"
     [System.Windows.Forms.MessageBox]::Show("Exchange validation complete.", "Complete", "OK", "Information")
 }
+
 
 function Show-ADResults {
     # Check if user is connected first
