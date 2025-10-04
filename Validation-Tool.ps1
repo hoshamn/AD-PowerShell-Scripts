@@ -19,6 +19,8 @@ Add-Type -AssemblyName System.Drawing
 $Script:Results = @{}
 $Script:ConnectionStatus = @{}
 $Script:Credential = $null
+$Script:AuthAttempts = 0
+$Script:AuthLockoutUntil = $null
 $Script:ServerInventory = @()
 $Script:CurrentResults = @{}
 $Script:ExchangeSessions = @{}
@@ -33,6 +35,18 @@ $Global:ProgressTotalSteps = 0
 $Global:ProgressCurrentStep = 0
 $Global:ValidationInProgress = $false
 
+# Configuration Thresholds
+$Script:Thresholds = @{
+    DiskWarningPercent = 85
+    DiskCriticalPercent = 95
+    CPUHighPercent = 80
+    MemoryHighPercent = 85
+    CertificateExpiryWarningDays = 30
+    AuthLockoutMinutes = 5
+    MaxAuthAttempts = 3
+    RemoteCommandTimeoutSeconds = 300
+}
+
 $Script:Colors = @{
     Success = [System.Drawing.Color]::FromArgb(212, 237, 218)
     Error = [System.Drawing.Color]::FromArgb(248, 215, 218)
@@ -44,18 +58,97 @@ $Script:Colors = @{
 
 #region Helper Functions
 
+function Test-ServerNameSafety {
+    param([string]$ServerName)
+    
+    # Must have a value
+    if ([string]::IsNullOrWhiteSpace($ServerName)) {
+        return $false
+    }
+    
+    # Only allow valid DNS characters: letters, numbers, dots, hyphens
+    if ($ServerName -notmatch '^[a-zA-Z0-9.-]+$') {
+        Write-Warning "Invalid server name (bad characters): $ServerName"
+        return $false
+    }
+    
+    # Block command injection attempts
+    if ($ServerName -match '(\||&|;|`|<|>|\$|\(|\)|{|})') {
+        Write-Warning "Potentially malicious server name blocked: $ServerName"
+        return $false
+    }
+    
+    # Must not be too long
+    if ($ServerName.Length -gt 253) {
+        Write-Warning "Server name too long: $ServerName"
+        return $false
+    }
+    
+    return $true
+}
+
+#region Audit Logging
+
+function Write-AuditLog {
+    param(
+        [string]$Action,
+        [string]$Target,
+        [string]$Result,
+        [string]$Details = ""
+    )
+    
+    $LogPath = ".\Logs"
+    if (-not (Test-Path $LogPath)) {
+        New-Item -Path $LogPath -ItemType Directory -Force | Out-Null
+    }
+    
+    $LogFile = Join-Path $LogPath "ValidationAudit-$(Get-Date -Format 'yyyyMM').log"
+    
+    $LogEntry = [PSCustomObject]@{
+        Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        User = if ($Script:Credential) { $Script:Credential.UserName } else { $env:USERNAME }
+        ComputerName = $env:COMPUTERNAME
+        Action = $Action
+        Target = $Target
+        Result = $Result
+        Details = $Details
+    }
+    
+    $LogEntry | Export-Csv -Path $LogFile -Append -NoTypeInformation
+}
+
+#endregion
+
 function Connect-WithCredentials {
+    # Check if locked out
+    if ($Script:AuthLockoutUntil -and (Get-Date) -lt $Script:AuthLockoutUntil) {
+        $RemainingSeconds = ($Script:AuthLockoutUntil - (Get-Date)).TotalSeconds
+        [System.Windows.Forms.MessageBox]::Show(
+            "Too many failed attempts!`n`nLocked for $([math]::Ceiling($RemainingSeconds)) more seconds.",
+            "Account Protection",
+            "OK",
+            "Warning"
+        )
+        Write-AuditLog -Action "Authentication" -Target "Blocked" -Result "RateLimited"
+        return $false
+    }
+    
     $NewCredential = Get-Credential -Message "Enter domain credentials for server access"
     
     if ($NewCredential) {
         Update-Status "Validating credentials..."
         
-        # Validate credentials first
         $ValidationResult = Test-CredentialValidity -Credential $NewCredential
         
         if ($ValidationResult.Valid) {
+            # SUCCESS - Reset everything
+            $Script:AuthAttempts = 0
+            $Script:AuthLockoutUntil = $null
             $Script:Credential = $NewCredential
             $Script:ConnectionStatus.Clear()
+            
+            Write-AuditLog -Action "Authentication" -Target $Script:Credential.UserName -Result "Success"
+            
             Update-CredentialDisplay
             
             [System.Windows.Forms.MessageBox]::Show(
@@ -68,12 +161,28 @@ function Connect-WithCredentials {
             return $true
         }
         else {
-            [System.Windows.Forms.MessageBox]::Show(
-                "Authentication Failed!`n`n$($ValidationResult.Message)`n`nPlease check your username and password.",
-                "Authentication Failed",
-                "OK",
-                "Error"
-            )
+            # FAILURE - Count attempts
+            $Script:AuthAttempts++
+            
+            Write-AuditLog -Action "Authentication" -Target $NewCredential.UserName -Result "Failed" -Details "Attempt $Script:AuthAttempts of 3"
+            
+            if ($Script:AuthAttempts -ge 3) {
+                # LOCK for 5 minutes
+                $Script:AuthLockoutUntil = (Get-Date).AddMinutes(5)
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Too many failed authentication attempts!`n`nLocked for 5 minutes for security protection.`n`nPlease verify your username and password.",
+                    "Account Protection - Locked",
+                    "OK",
+                    "Warning"
+                )
+            } else {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Authentication Failed!`n`n$($ValidationResult.Message)`n`nAttempt $Script:AuthAttempts of 3",
+                    "Authentication Failed",
+                    "OK",
+                    "Error"
+                )
+            }
             Update-Status "Authentication failed"
             return $false
         }
@@ -1100,7 +1209,7 @@ function Get-ServerDetails {
                 UsedSpace = "$UsedGB GB"
                 FreeSpace = "$FreeGB GB"
                 UsagePercent = "$UsagePercent%"
-                Status = if ($UsagePercent -lt 85) { "Normal" } elseif ($UsagePercent -lt 95) { "Warning" } else { "Critical" }
+                Status = if ($UsagePercent -lt $Script:Thresholds.DiskWarningPercent) { "Normal" } elseif ($UsagePercent -lt $Script:Thresholds.DiskCriticalPercent) { "Warning" } else { "Critical" }
             }
         }
         $ServiceList = @(
@@ -1147,7 +1256,7 @@ function Get-ServerUtilization {
             $Results.CPU += [PSCustomObject]@{
                 Metric = "Processor"
                 Value = $CPU.Name
-                Status = if ($CPUUsage -lt 80) { "Normal" } else { "High" }
+                Status = if ($CPUUsage -lt $Script:Thresholds.CPUHighPercent) { "Normal" } else { "High" }
             }
             $Results.CPU += [PSCustomObject]@{
                 Metric = "Cores / Logical"
@@ -1157,7 +1266,7 @@ function Get-ServerUtilization {
             $Results.CPU += [PSCustomObject]@{
                 Metric = "Current Usage"
                 Value = "$CPUUsage%"
-                Status = if ($CPUUsage -lt 80) { "Normal" } else { "High" }
+                Status = if ($CPUUsage -lt $Script:Thresholds.CPUHighPercent) { "Normal" } else { "High" }
             }
             $OS = Get-WmiObject -Class Win32_OperatingSystem
             $TotalMemGB = [math]::Round($OS.TotalVisibleMemorySize / 1MB, 2)
@@ -1167,7 +1276,7 @@ function Get-ServerUtilization {
             $Results.Memory += [PSCustomObject]@{
                 Metric = "Total Memory"
                 Value = "$TotalMemGB GB"
-                Status = if ($MemPercent -lt 85) { "Normal" } else { "High" }
+                Status = if ($MemPercent -lt $Script:Thresholds.MemoryHighPercent) { "Normal" } else { "High" }
             }
             $Results.Memory += [PSCustomObject]@{
                 Metric = "Used Memory"
@@ -1182,7 +1291,7 @@ function Get-ServerUtilization {
             $Results.Memory += [PSCustomObject]@{
                 Metric = "Usage Percentage"
                 Value = "$MemPercent%"
-                Status = if ($MemPercent -lt 85) { "Normal" } else { "High" }
+                Status = if ($MemPercent -lt $Script:Thresholds.MemoryHighPercent) { "Normal" } else { "High" }
             }
             $Disks = Get-WmiObject -Class Win32_LogicalDisk | Where-Object { $_.DriveType -eq 3 }
             foreach ($Disk in $Disks) {
@@ -1347,7 +1456,7 @@ function Test-ExchangeComprehensive {
             $Certs = Get-ExchangeCertificate -ErrorAction SilentlyContinue
             foreach ($Cert in $Certs) {
                 $DaysToExpire = ($Cert.NotAfter - (Get-Date)).Days
-                $Status = if ($DaysToExpire -lt 30) { "Expiring Soon" } elseif ($DaysToExpire -lt 0) { "EXPIRED" } else { "Valid" }
+                $Status = if ($DaysToExpire -lt $Script:Thresholds.CertificateExpiryWarningDays) { "Expiring Soon" } elseif ($DaysToExpire -lt 0) { "EXPIRED" } else { "Valid" }
                 $Results.Certificates += [PSCustomObject]@{
                     Subject = $Cert.Subject
                     Thumbprint = $Cert.Thumbprint
@@ -2183,7 +2292,7 @@ function Test-ADFSComprehensive {
                     
                     if ($Cert) {
                         $DaysToExpire = ($Cert.NotAfter - (Get-Date)).Days
-                        $Status = if ($DaysToExpire -lt 30) { "Expiring Soon" } elseif ($DaysToExpire -lt 0) { "EXPIRED" } else { "Valid" }
+                        $Status = if ($DaysToExpire -lt $Script:Thresholds.CertificateExpiryWarningDays) { "Expiring Soon" } elseif ($DaysToExpire -lt 0) { "EXPIRED" } else { "Valid" }
                         
                         $Results.SSLCertificates += [PSCustomObject]@{
                             Subject = $Cert.Subject
@@ -2209,7 +2318,7 @@ function Test-ADFSComprehensive {
             
             foreach ($Cert in $PersonalCerts) {
                 $DaysToExpire = ($Cert.NotAfter - (Get-Date)).Days
-                $Status = if ($DaysToExpire -lt 30) { "Expiring Soon" } elseif ($DaysToExpire -lt 0) { "EXPIRED" } else { "Valid" }
+                $Status = if ($DaysToExpire -lt $Script:Thresholds.CertificateExpiryWarningDays) { "Expiring Soon" } elseif ($DaysToExpire -lt 0) { "EXPIRED" } else { "Valid" }
                 
                 $Results.SSLCertificates += [PSCustomObject]@{
                     Subject = $Cert.Subject
@@ -2273,7 +2382,7 @@ function Test-ADFSComprehensive {
                         
                         if ($CertObj) {
                             $DaysToExpire = ($CertObj.NotAfter - (Get-Date)).Days
-                            $Status = if ($DaysToExpire -lt 30) { "Expiring Soon" } elseif ($DaysToExpire -lt 0) { "EXPIRED" } else { "Valid" }
+                            $Status = if ($DaysToExpire -lt $Script:Thresholds.CertificateExpiryWarningDays) { "Expiring Soon" } elseif ($DaysToExpire -lt 0) { "EXPIRED" } else { "Valid" }
                             
                             $Results.TokenSigningCerts += [PSCustomObject]@{
                                 CertificateType = "Token-Signing"
@@ -2295,7 +2404,7 @@ function Test-ADFSComprehensive {
                         
                         if ($CertObj) {
                             $DaysToExpire = ($CertObj.NotAfter - (Get-Date)).Days
-                            $Status = if ($DaysToExpire -lt 30) { "Expiring Soon" } elseif ($DaysToExpire -lt 0) { "EXPIRED" } else { "Valid" }
+                            $Status = if ($DaysToExpire -lt $Script:Thresholds.CertificateExpiryWarningDays) { "Expiring Soon" } elseif ($DaysToExpire -lt 0) { "EXPIRED" } else { "Valid" }
                             
                             $Results.TokenSigningCerts += [PSCustomObject]@{
                                 CertificateType = "Token-Decrypting"
@@ -2334,7 +2443,7 @@ function Test-ADFSComprehensive {
                 if ($TokenCerts) {
                     foreach ($Cert in $TokenCerts) {
                         $DaysToExpire = ($Cert.NotAfter - (Get-Date)).Days
-                        $Status = if ($DaysToExpire -lt 30) { "Expiring Soon" } elseif ($DaysToExpire -lt 0) { "EXPIRED" } else { "Valid" }
+                        $Status = if ($DaysToExpire -lt $Script:Thresholds.CertificateExpiryWarningDays) { "Expiring Soon" } elseif ($DaysToExpire -lt 0) { "EXPIRED" } else { "Valid" }
                         
                         $Results.TokenSigningCerts += [PSCustomObject]@{
                             CertificateType = "Token Signing (Manual Check)"
@@ -2695,10 +2804,24 @@ function Show-UtilizationResults {
     
     # CHECK PERMISSIONS - Require Local Administrator rights
     Update-Status "Verifying administrative permissions on servers..."
-    
+
+    # FIRST get the server list
+    $Servers = $Script:ServerInventory
+
+    if ($Servers.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "No servers found in inventory.`n`nPlease add servers to servers.txt",
+            "No Servers",
+            "OK",
+            "Warning"
+        )
+        return
+    }
+
     $HasAdminAccess = $false
     $TestedServers = @()
-    
+
+    # Test up to 3 servers to verify admin rights
     foreach ($Server in ($Servers | Select-Object -First 3)) {
         if (Test-ServerConnection -ServerName $Server.Name -Credential $Script:Credential) {
             $TestedServers += $Server.Name
@@ -2707,38 +2830,51 @@ function Show-UtilizationResults {
             $ScriptBlock = {
                 $CurrentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent()
                 $UserPrincipal = New-Object System.Security.Principal.WindowsPrincipal($CurrentUser)
-                $AdminRole = [System.Windows.Principal.WindowsBuiltInRole]::Administrator
+                $AdminRole = [System.Security.Principal.WindowsBuiltInRole]::Administrator
                 return $UserPrincipal.IsInRole($AdminRole)
             }
             
             $AdminCheck = Invoke-SafeRemoteCommand -ServerName $Server.Name -ScriptBlock $ScriptBlock -Credential $Script:Credential
             if ($AdminCheck.Success -and $AdminCheck.Data) {
                 $HasAdminAccess = $true
+                Write-AuditLog -Action "PermissionCheck" -Target $Server.Name -Result "AdminAccess" -Details "Local Administrator confirmed"
                 break
             }
         }
     }
+
+    
     
     if (-not $HasAdminAccess) {
         $TestedList = if ($TestedServers.Count -gt 0) { ($TestedServers -join ", ") } else { "None - connection failed" }
-        [System.Windows.Forms.MessageBox]::Show(
-            "PERMISSION DENIED`n`nThe connected user does not have Local Administrator rights on the servers.`n`nTested Servers: $TestedList`n`nValidation cannot proceed.`n`nREQUIRED: Local Administrator rights on target servers",
-            "Insufficient Permissions",
-            "OK",
-            "Error"
-        )
-        Update-Status "Utilization validation blocked - not a local administrator"
+        
+        # Different messages based on what failed
+        if ($TestedServers.Count -eq 0) {
+            # Couldn't connect to any servers
+            [System.Windows.Forms.MessageBox]::Show(
+                "CONNECTION FAILED`n`nCannot connect to any servers in inventory.`n`nPossible causes:`n- WinRM not enabled on servers`n- Firewall blocking connection`n- Invalid server names in servers.txt`n- Network connectivity issue`n`nCheck servers.txt and try again.",
+                "Connection Failed",
+                "OK",
+                "Error"
+            )
+            Write-AuditLog -Action "UtilizationValidation" -Target "ConnectionFailed" -Result "NoServersReachable"
+        }
+        else {
+            # Connected but not admin
+            [System.Windows.Forms.MessageBox]::Show(
+                "PERMISSION DENIED`n`nThe connected user does not have Local Administrator rights on the servers.`n`nTested Servers: $TestedList`n`nCurrent User: $($Script:Credential.UserName)`n`nValidation cannot proceed.`n`nREQUIRED: Local Administrator rights on target servers",
+                "Insufficient Permissions",
+                "OK",
+                "Error"
+            )
+            Write-AuditLog -Action "UtilizationValidation" -Target $TestedList -Result "NotLocalAdmin"
+        }
+        
+        Update-Status "Utilization validation blocked - insufficient permissions"
         return
     }
 
-    # Get ALL servers from inventory
-    $Servers = $Script:ServerInventory
-    
-    if ($Servers.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show("No servers found in inventory", "Info", "OK", "Information")
-        return
-    }
-    
+        
     # Start progress tracking
     if (-not (Start-ValidationProgress -ValidationName "System Utilization" -TotalSteps ($Servers.Count + 2))) {
         return
@@ -2988,16 +3124,36 @@ function Show-ExchangeResults {
     Update-Status "Checking Exchange permissions..."
     $PermCheck = Test-ExchangePermissions -Credential $Script:Credential
     
-    if (-not $PermCheck.HasPermission) {
-        Show-PermissionCheckDialog -ValidationType "Exchange Server" -PermissionResults $PermCheck
+    # ALWAYS show permission dialog (success or failure)
+    $UserClickedContinue = Show-PermissionCheckDialog -ValidationType "Exchange Server" -PermissionResults $PermCheck
+
+    # Block if no permissions OR user clicked Close instead of Continue
+    # Block if no permissions OR user clicked Close instead of Continue
+    if (-not $PermCheck.HasPermission -or -not $UserClickedContinue) {
         
-        [System.Windows.Forms.MessageBox]::Show(
-            "VALIDATION BLOCKED`n`nInsufficient Permissions`n`nREQUIRED: Organization Management group membership`n`nValidation cannot proceed.",
-            "Access Denied",
-            "OK",
-            "Error"
-        )
-        Update-Status "Exchange validation blocked - insufficient permissions"
+        # Show different message depending on WHY validation was blocked
+        if (-not $PermCheck.HasPermission) {
+            # User lacks permissions
+            [System.Windows.Forms.MessageBox]::Show(
+                "VALIDATION BLOCKED`n`nInsufficient Permissions`n`nREQUIRED: Organization Management group membership`n`nValidation cannot proceed.",
+                "Access Denied - Missing Permissions",
+                "OK",
+                "Error"
+            )
+            Update-Status "Exchange validation blocked - insufficient permissions"
+        }
+        else {
+            # User has permissions but clicked Close
+            [System.Windows.Forms.MessageBox]::Show(
+                "Validation Cancelled`n`nYou clicked 'Close' instead of 'Continue with Validation'.`n`nPermission check passed, but you chose not to proceed.`n`nClick 'Exchange Validation' again to retry.",
+                "Validation Cancelled by User",
+                "OK",
+                "Information"
+            )
+            Update-Status "Exchange validation cancelled by user"
+        }
+        
+        Write-AuditLog -Action "ExchangeValidation" -Target "Cancelled" -Result "UserChoice"
         return
     }
     
@@ -3263,7 +3419,14 @@ function Show-ADResults {
     $ContinueValidation = Show-PermissionCheckDialog -ValidationType "Active Directory" -PermissionResults $PermCheck
     
     if (-not $ContinueValidation) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Validation Cancelled`n`nYou chose not to proceed with Active Directory validation.`n`nClick 'AD Validation' again to retry.",
+            "Validation Cancelled by User",
+            "OK",
+            "Information"
+        )
         Update-Status "AD validation cancelled by user"
+        Write-AuditLog -Action "ADValidation" -Target "Cancelled" -Result "UserChoice"
         return
     }
     
@@ -3427,7 +3590,14 @@ function Show-ADFSResults {
     $ContinueValidation = Show-PermissionCheckDialog -ValidationType "ADFS" -PermissionResults $PermCheck
     
     if (-not $ContinueValidation) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Validation Cancelled`n`nYou chose not to proceed with ADFS validation.`n`nClick 'ADFS Validation' again to retry.",
+            "Validation Cancelled by User",
+            "OK",
+            "Information"
+        )
         Update-Status "ADFS validation cancelled by user"
+        Write-AuditLog -Action "ADFSValidation" -Target "Cancelled" -Result "UserChoice"
         return
     }
     
@@ -3584,6 +3754,22 @@ function Export-ValidationReport {
     }
 }
 
+function Sanitize-HTMLContent {
+    param([string]$Content)
+    
+    if ([string]::IsNullOrEmpty($Content)) {
+        return ""
+    }
+    
+    # Basic HTML encoding
+    $Content = $Content -replace '&', '&amp;'
+    $Content = $Content -replace '<', '&lt;'
+    $Content = $Content -replace '>', '&gt;'
+    $Content = $Content -replace '"', '&quot;'
+    $Content = $Content -replace "'", '&#39;'
+    
+    return $Content
+}
 function Generate-HTMLReport {
     param([hashtable]$Results)
     $HTML = @"
@@ -3640,7 +3826,7 @@ function Generate-HTMLReport {
                     }
                     $HTML += "<tr class='$RowClass'>"
                     foreach ($Prop in $Properties) {
-                        $HTML += "<td>$($Item.$Prop)</td>"
+                        $HTML += "<td>$(Sanitize-HTMLContent -Content $Item.$Prop)</td>"
                     }
                     $HTML += "</tr>"
                 }
@@ -3674,9 +3860,18 @@ NN-TEST-EX02.nourtest.com, Exchange
         if ($Line.Trim() -and -not $Line.StartsWith('#')) {
             $Parts = $Line.Split(',')
             if ($Parts.Count -ge 2) {
-                $Servers += @{
-                    Name = $Parts[0].Trim()
-                    Role = $Parts[1].Trim()
+                $ServerName = $Parts[0].Trim()
+                $ServerRole = $Parts[1].Trim()
+                
+                # SECURITY CHECK - Validate server name
+                if (Test-ServerNameSafety -ServerName $ServerName) {
+                    $Servers += @{
+                        Name = $ServerName
+                        Role = $ServerRole
+                    }
+                } else {
+                    Write-Warning "Skipped unsafe server entry: $ServerName"
+                    Write-AuditLog -Action "ServerInventory" -Target $ServerName -Result "Rejected" -Details "Failed safety validation"
                 }
             }
         }
@@ -3691,6 +3886,28 @@ NN-TEST-EX02.nourtest.com, Exchange
 function Show-ValidationGUI {
     $Script:ServerInventory = Load-ServerInventory
     $Global:MainForm = New-Object System.Windows.Forms.Form
+
+    # Add cleanup when form closes
+    $Global:MainForm.Add_FormClosing({
+        param($sender, $e)
+        
+        # Clear credentials
+        if ($Script:Credential) {
+            Write-AuditLog -Action "Disconnect" -Target $Script:Credential.UserName -Result "AutoCleanup"
+            $Script:Credential = $null
+        }
+        
+        # Close all Exchange sessions
+        foreach ($ServerName in $Script:ExchangeSessions.Keys) {
+            try {
+                Disconnect-ExchangeRemote -ServerName $ServerName
+            } catch {}
+        }
+        
+        # Force memory cleanup
+        [System.GC]::Collect()
+        [System.GC]::WaitForPendingFinalizers()
+    })
     $Global:MainForm.Text = "Infrastructure Validation Tool v2.4"
     $Global:MainForm.Size = New-Object System.Drawing.Size(1500, 900)
     $Global:MainForm.StartPosition = "CenterScreen"
@@ -4157,3 +4374,31 @@ function Show-ValidationGUI {
 #endregion
 
 Show-ValidationGUI
+
+# Display Security Features on Startup
+Write-Host "`n" -NoNewline
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host "  SECURITY FEATURES ENABLED" -ForegroundColor Green
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "  [OK] Audit logging active" -ForegroundColor Green
+Write-Host "      Location: .\Logs\" -ForegroundColor Gray
+Write-Host ""
+Write-Host "  [OK] Authentication rate limiting" -ForegroundColor Green
+Write-Host "      Max attempts: 3" -ForegroundColor Gray
+Write-Host "      Lockout time: 5 minutes" -ForegroundColor Gray
+Write-Host ""
+Write-Host "  [OK] Server name validation" -ForegroundColor Green
+Write-Host "      Prevents injection attacks" -ForegroundColor Gray
+Write-Host ""
+Write-Host "  [OK] Auto-cleanup on exit" -ForegroundColor Green
+Write-Host "      Credentials cleared from memory" -ForegroundColor Gray
+Write-Host ""
+Write-Host "  [OK] Remote timeout protection" -ForegroundColor Green
+Write-Host "      Timeout: 5 minutes" -ForegroundColor Gray
+Write-Host ""
+Write-Host "  [OK] HTML report sanitization" -ForegroundColor Green
+Write-Host "      XSS prevention enabled" -ForegroundColor Gray
+Write-Host ""
+Write-Host "========================================" -ForegroundColor Cyan
+Write-Host ""
