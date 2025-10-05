@@ -2788,7 +2788,6 @@ function Test-ADFSComprehensive {
 #endregion
 
 #region Button Handlers
-#region Button Handlers
 
 function Show-UtilizationResults {
     # Check if user is connected first
@@ -2818,7 +2817,13 @@ function Show-UtilizationResults {
         return
     }
 
-    $HasAdminAccess = $false
+    # Initialize permission check results
+    $PermCheck = @{
+        HasPermission = $false
+        MissingPermissions = @()
+        Details = @()
+    }
+
     $TestedServers = @()
 
     # Test up to 3 servers to verify admin rights
@@ -2831,50 +2836,135 @@ function Show-UtilizationResults {
                 $CurrentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent()
                 $UserPrincipal = New-Object System.Security.Principal.WindowsPrincipal($CurrentUser)
                 $AdminRole = [System.Security.Principal.WindowsBuiltInRole]::Administrator
-                return $UserPrincipal.IsInRole($AdminRole)
+                
+                $Result = @{
+                    IsAdmin = $UserPrincipal.IsInRole($AdminRole)
+                    UserIdentity = $CurrentUser.Name
+                    Groups = @()
+                }
+                
+                # Get group memberships for reporting
+                foreach ($Group in $CurrentUser.Groups) {
+                    try {
+                        $GroupSID = New-Object System.Security.Principal.SecurityIdentifier($Group)
+                        $GroupName = $GroupSID.Translate([System.Security.Principal.NTAccount]).Value
+                        $Result.Groups += $GroupName
+                    } catch {}
+                }
+                
+                return $Result
             }
             
             $AdminCheck = Invoke-SafeRemoteCommand -ServerName $Server.Name -ScriptBlock $ScriptBlock -Credential $Script:Credential
+            
             if ($AdminCheck.Success -and $AdminCheck.Data) {
-                $HasAdminAccess = $true
-                Write-AuditLog -Action "PermissionCheck" -Target $Server.Name -Result "AdminAccess" -Details "Local Administrator confirmed"
-                break
+                $Data = $AdminCheck.Data
+                
+                $PermCheck.Details += "[INFO] Tested server: $($Server.Name)"
+                $PermCheck.Details += "[INFO] Running as: $($Data.UserIdentity)"
+                
+                if ($Data.IsAdmin) {
+                    $PermCheck.HasPermission = $true
+                    $PermCheck.Details += "[OK] Has Local Administrator rights on $($Server.Name)"
+                    
+                    # Show relevant group memberships
+                    $RelevantGroups = $Data.Groups | Where-Object { 
+                        $_ -match "Administrators|Domain Admins|Enterprise Admins" 
+                    }
+                    
+                    if ($RelevantGroups) {
+                        $PermCheck.Details += "[INFO] Member of: $($RelevantGroups -join ', ')"
+                    }
+                    
+                    Write-AuditLog -Action "PermissionCheck" -Target $Server.Name -Result "AdminAccess" -Details "Local Administrator confirmed"
+                    break
+                } else {
+                    $PermCheck.MissingPermissions += "NOT a Local Administrator on $($Server.Name)"
+                    $PermCheck.Details += "[FAIL] User lacks Local Administrator rights on $($Server.Name)"
+                }
             }
         }
     }
-
     
+    # Handle connection failures
+    if ($TestedServers.Count -eq 0) {
+        $PermCheck.MissingPermissions += "Cannot connect to any servers in inventory"
+        $PermCheck.Details += "[ERROR] No servers reachable - check WinRM, firewall, or servers.txt"
+        $PermCheck.HasPermission = $false
+    }
     
-    if (-not $HasAdminAccess) {
-        $TestedList = if ($TestedServers.Count -gt 0) { ($TestedServers -join ", ") } else { "None - connection failed" }
+    # Add summary if no permissions
+    if (-not $PermCheck.HasPermission -and $TestedServers.Count -gt 0) {
+        $PermCheck.Details += ""
+        $PermCheck.Details += "======================================================================"
+        $PermCheck.Details += "REQUIREMENT: Local Administrator rights on target servers"
+        $PermCheck.Details += "======================================================================"
+        $PermCheck.Details += "Tested servers: $($TestedServers -join ', ')"
+        $PermCheck.Details += "Current user: $($Script:Credential.UserName)"
+    }
+    
+    # Add success summary if permissions OK
+    if ($PermCheck.HasPermission) {
+        $PermCheck.Details += ""
+        $PermCheck.Details += "CAPABILITIES VERIFIED:"
+        $PermCheck.Details += "=" * 60
+        $PermCheck.Details += "[OK] Can read system performance counters"
+        $PermCheck.Details += "[OK] Can query WMI for hardware information"
+        $PermCheck.Details += "[OK] Can access disk information"
+        $PermCheck.Details += "[OK] Can read service status"
+        $PermCheck.Details += ""
+        $PermCheck.Details += "======================================================================"
+        $PermCheck.Details += "PERMISSION CHECK PASSED - Ready to proceed with validation"
+        $PermCheck.Details += "======================================================================"
+    }
+    
+    # ALWAYS show permission dialog (success or failure)
+    $UserClickedContinue = Show-PermissionCheckDialog -ValidationType "System Utilization" -PermissionResults $PermCheck
+    
+    # Block if no permissions OR user clicked Close instead of Continue
+    if (-not $PermCheck.HasPermission -or -not $UserClickedContinue) {
         
-        # Different messages based on what failed
-        if ($TestedServers.Count -eq 0) {
-            # Couldn't connect to any servers
-            [System.Windows.Forms.MessageBox]::Show(
-                "CONNECTION FAILED`n`nCannot connect to any servers in inventory.`n`nPossible causes:`n- WinRM not enabled on servers`n- Firewall blocking connection`n- Invalid server names in servers.txt`n- Network connectivity issue`n`nCheck servers.txt and try again.",
-                "Connection Failed",
-                "OK",
-                "Error"
-            )
-            Write-AuditLog -Action "UtilizationValidation" -Target "ConnectionFailed" -Result "NoServersReachable"
+        # Show different message depending on WHY validation was blocked
+        if (-not $PermCheck.HasPermission) {
+            # User lacks permissions
+            if ($TestedServers.Count -eq 0) {
+                # Couldn't connect to any servers
+                [System.Windows.Forms.MessageBox]::Show(
+                    "CONNECTION FAILED`n`nCannot connect to any servers in inventory.`n`nPossible causes:`n- WinRM not enabled on servers`n- Firewall blocking connection`n- Invalid server names in servers.txt`n- Network connectivity issue`n`nCheck servers.txt and try again.",
+                    "Connection Failed - Cannot Validate",
+                    "OK",
+                    "Error"
+                )
+                Write-AuditLog -Action "UtilizationValidation" -Target "ConnectionFailed" -Result "NoServersReachable"
+            } else {
+                # Connected but not admin
+                [System.Windows.Forms.MessageBox]::Show(
+                    "VALIDATION BLOCKED`n`nInsufficient Permissions`n`nREQUIRED: Local Administrator rights on target servers`n`nCurrent User: $($Script:Credential.UserName)`nTested Servers: $($TestedServers -join ', ')`n`nValidation cannot proceed.",
+                    "Access Denied - Missing Permissions",
+                    "OK",
+                    "Error"
+                )
+                Write-AuditLog -Action "UtilizationValidation" -Target ($TestedServers -join ',') -Result "NotLocalAdmin"
+            }
+            Update-Status "Utilization validation blocked - insufficient permissions"
         }
         else {
-            # Connected but not admin
+            # User has permissions but clicked Close
             [System.Windows.Forms.MessageBox]::Show(
-                "PERMISSION DENIED`n`nThe connected user does not have Local Administrator rights on the servers.`n`nTested Servers: $TestedList`n`nCurrent User: $($Script:Credential.UserName)`n`nValidation cannot proceed.`n`nREQUIRED: Local Administrator rights on target servers",
-                "Insufficient Permissions",
+                "Validation Cancelled`n`nYou clicked 'Close' instead of 'Continue with Validation'.`n`nPermission check passed, but you chose not to proceed.`n`nClick 'System Utilization' again to retry.",
+                "Validation Cancelled by User",
                 "OK",
-                "Error"
+                "Information"
             )
-            Write-AuditLog -Action "UtilizationValidation" -Target $TestedList -Result "NotLocalAdmin"
+            Update-Status "Utilization validation cancelled by user"
+            Write-AuditLog -Action "UtilizationValidation" -Target "Cancelled" -Result "UserChoice"
         }
         
-        Update-Status "Utilization validation blocked - insufficient permissions"
         return
     }
-
-        
+    
+    Update-Status "Permission check passed - proceeding with utilization validation..."
+    
     # Start progress tracking
     if (-not (Start-ValidationProgress -ValidationName "System Utilization" -TotalSteps ($Servers.Count + 2))) {
         return
@@ -2884,11 +2974,6 @@ function Show-UtilizationResults {
     $Script:CurrentResults.Clear()
 
     Update-ValidationProgress -CurrentStep 1 -StatusText "Preparing system utilization validation..."
-    
-    if ($Servers.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show("No servers found in inventory", "Info", "OK", "Information")
-        return
-    }
     
     # Clear existing results
     $Script:CurrentResults.Clear()
@@ -2910,10 +2995,14 @@ function Show-UtilizationResults {
     $ScrollPanel.BackColor = [System.Drawing.Color]::White
     
     $YPosition = 10
+    $StepCounter = 2
     
     # Loop through each server
     foreach ($Server in $Servers) {
         $ServerName = $Server.Name
+        
+        Update-ValidationProgress -CurrentStep $StepCounter -StatusText "Validating $ServerName..."
+        $StepCounter++
         
         if (Test-ServerConnection -ServerName $ServerName -Credential $Script:Credential) {
             $Data = Get-ServerUtilization -ServerName $ServerName -Credential $Script:Credential
