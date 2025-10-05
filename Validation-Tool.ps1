@@ -5,8 +5,8 @@
 .DESCRIPTION
     Professional validation with Excel-style tables and permission checking
 .NOTES
-    Version: 2.5
-    Author: Hisham Nasur - NourNet - MS-TEAM1
+    Version: 1.0
+    Author: Hisham Nasur - NN - MS Operation
 #>
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -40,7 +40,7 @@ $Script:Thresholds = @{
     DiskWarningPercent = 85
     DiskCriticalPercent = 95
     CPUHighPercent = 80
-    MemoryHighPercent = 85
+    MemoryHighPercent = 90
     CertificateExpiryWarningDays = 30
     AuthLockoutMinutes = 5
     MaxAuthAttempts = 3
@@ -203,7 +203,9 @@ function Disconnect-Credentials {
             $Script:Credential = $null
             $Script:ConnectionStatus.Clear()
             
-            foreach ($ServerName in $Script:ExchangeSessions.Keys) {
+            # Create a copy of the keys to avoid collection modification error
+            $SessionKeys = @($Script:ExchangeSessions.Keys)
+            foreach ($ServerName in $SessionKeys) {
                 Disconnect-ExchangeRemote -ServerName $ServerName
             }
             
@@ -1365,13 +1367,121 @@ function Test-ExchangeComprehensive {
         try {
             $Databases = Get-MailboxDatabase -Status -ErrorAction Stop
             foreach ($DB in $Databases) {
-                $ProhibitSend = if ($DB.ProhibitSendQuota) { $DB.ProhibitSendQuota } else { "Not Set" }
-                $ProhibitReceive = if ($DB.ProhibitSendReceiveQuota) { $DB.ProhibitSendReceiveQuota } else { "Not Set" }
-                $Warning = if ($DB.IssueWarningQuota) { $DB.IssueWarningQuota } else { "Not Set" }
-                $OAB = if ($DB.OfflineAddressBook) { $DB.OfflineAddressBook.Name } else { "Not Set" }
+                # Fix for quotas
+                $ProhibitSend = if ($DB.ProhibitSendQuota -and $DB.ProhibitSendQuota -ne "Unlimited") { 
+                    $DB.ProhibitSendQuota.ToString() 
+                } else { 
+                    "Unlimited" 
+                }
+                
+                $ProhibitReceive = if ($DB.ProhibitSendReceiveQuota -and $DB.ProhibitSendReceiveQuota -ne "Unlimited") { 
+                    $DB.ProhibitSendReceiveQuota.ToString() 
+                } else { 
+                    "Unlimited" 
+                }
+                
+                $Warning = if ($DB.IssueWarningQuota -and $DB.IssueWarningQuota -ne "Unlimited") { 
+                    $DB.IssueWarningQuota.ToString() 
+                } else { 
+                    "Unlimited" 
+                }
+                
+                # FIXED: Properly get server name with multiple methods
+                $ServerName = "Unknown"
+                
+                # Method 1: Check Server.Name property
+                if ($DB.Server) {
+                    if ($DB.Server.Name) {
+                        $ServerName = $DB.Server.Name
+                    }
+                    elseif ($DB.Server -is [string]) {
+                        $ServerName = $DB.Server
+                    }
+                    else {
+                        $ServerName = $DB.Server.ToString()
+                    }
+                }
+                
+                # Method 2: Check MountedOnServer property (more reliable)
+                if ($ServerName -eq "Unknown" -and $DB.MountedOnServer) {
+                    $ServerName = $DB.MountedOnServer
+                }
+                
+                # Method 3: Try to get server from Master property
+                if ($ServerName -eq "Unknown" -and $DB.Master) {
+                    if ($DB.Master.Name) {
+                        $ServerName = $DB.Master.Name
+                    }
+                    else {
+                        $ServerName = $DB.Master.ToString()
+                    }
+                }
+                
+                # Method 4: Extract from DistinguishedName
+                if ($ServerName -eq "Unknown" -and $DB.DistinguishedName) {
+                    if ($DB.DistinguishedName -match 'CN=([^,]+),CN=Databases') {
+                        # Try to find server in DN path
+                        if ($DB.DistinguishedName -match 'CN=([^,]+),CN=Configuration') {
+                            $ServerName = $matches[1]
+                        }
+                    }
+                }
+                
+                # Clean up server name (remove FQDN if present, keep just hostname)
+                if ($ServerName -ne "Unknown" -and $ServerName -like "*.*") {
+                    $ServerName = $ServerName.Split('.')[0]
+                }
+                
+                # FIXED: Properly retrieve OAB with multiple fallback methods
+                $OAB = "Not Configured"
+                
+                # Method 1: Direct property check
+                if ($DB.OfflineAddressBook) {
+                    if ($DB.OfflineAddressBook.Name) {
+                        $OAB = $DB.OfflineAddressBook.Name
+                    }
+                    elseif ($DB.OfflineAddressBook -is [string]) {
+                        $OAB = $DB.OfflineAddressBook
+                    }
+                    else {
+                        $OAB = $DB.OfflineAddressBook.ToString()
+                    }
+                }
+                
+                # Method 2: If still not found, query Exchange directly
+                if ($OAB -eq "Not Configured") {
+                    try {
+                        $DBDetail = Get-MailboxDatabase -Identity $DB.Name -ErrorAction SilentlyContinue
+                        if ($DBDetail.OfflineAddressBook) {
+                            if ($DBDetail.OfflineAddressBook.Name) {
+                                $OAB = $DBDetail.OfflineAddressBook.Name
+                            }
+                            else {
+                                $OAB = $DBDetail.OfflineAddressBook.ToString()
+                            }
+                        }
+                    }
+                    catch {
+                        # Keep "Not Configured" if query fails
+                    }
+                }
+                
+                # Method 3: Check if there's a default OAB assigned to the organization
+                if ($OAB -eq "Not Configured") {
+                    try {
+                        $DefaultOAB = Get-OfflineAddressBook -ErrorAction SilentlyContinue | Where-Object { $_.IsDefault -eq $true } | Select-Object -First 1
+                        if ($DefaultOAB) {
+                            $OAB = "$($DefaultOAB.Name) (Default)"
+                        }
+                    }
+                    catch {
+                        # Keep "Not Configured"
+                    }
+                }
+                
                 $Results.MailboxDatabases += [PSCustomObject]@{
                     DatabaseName = $DB.Name
-                    Server = $DB.Server.Name
+                    Server = $ServerName
                     Mounted = if ($DB.Mounted) { "Yes" } else { "No" }
                     OfflineAddressBook = $OAB
                     ProhibitSendQuota = $ProhibitSend
@@ -1380,36 +1490,161 @@ function Test-ExchangeComprehensive {
                     Status = if ($DB.Mounted) { "OK" } else { "ERROR" }
                 }
             }
-        } catch {}
+        } catch {
+            # If entire database query fails, add error entry
+            $Results.MailboxDatabases += [PSCustomObject]@{
+                DatabaseName = "Error retrieving databases"
+                Server = $_.Exception.Message
+                Mounted = "N/A"
+                OfflineAddressBook = "N/A"
+                ProhibitSendQuota = "N/A"
+                ProhibitSendReceiveQuota = "N/A"
+                IssueWarningQuota = "N/A"
+                Status = "Failed"
+            }
+        }
         try {
             $Arbitration = Get-Mailbox -Arbitration -ErrorAction SilentlyContinue
             $Monitoring = Get-Mailbox -Monitoring -ErrorAction SilentlyContinue
             $AuditLog = Get-Mailbox -AuditLog -ErrorAction SilentlyContinue
+            
             foreach ($Mbx in $Arbitration) {
+                # FIXED: Properly get database name with multiple methods
+                $DatabaseName = "Not Assigned"
+                
+                # Method 1: Check Database.Name property
+                if ($Mbx.Database) {
+                    if ($Mbx.Database.Name) {
+                        $DatabaseName = $Mbx.Database.Name
+                    }
+                    elseif ($Mbx.Database -is [string]) {
+                        $DatabaseName = $Mbx.Database
+                    }
+                    else {
+                        $DatabaseName = $Mbx.Database.ToString()
+                    }
+                }
+                
+                # Method 2: Try to get from full object
+                if ($DatabaseName -eq "Not Assigned") {
+                    try {
+                        $MbxDetail = Get-Mailbox -Identity $Mbx.Identity -ErrorAction SilentlyContinue
+                        if ($MbxDetail.Database) {
+                            if ($MbxDetail.Database.Name) {
+                                $DatabaseName = $MbxDetail.Database.Name
+                            }
+                            else {
+                                $DatabaseName = $MbxDetail.Database.ToString()
+                            }
+                        }
+                    }
+                    catch {
+                        # Keep "Not Assigned"
+                    }
+                }
+                
                 $Results.SystemMailboxes += [PSCustomObject]@{
                     Type = "Arbitration"
                     Name = $Mbx.Name
-                    Database = $Mbx.Database.Name
+                    Database = $DatabaseName
                     Status = "OK"
                 }
             }
+            
             foreach ($Mbx in $Monitoring) {
+                # FIXED: Properly get database name with multiple methods
+                $DatabaseName = "Not Assigned"
+                
+                # Method 1: Check Database.Name property
+                if ($Mbx.Database) {
+                    if ($Mbx.Database.Name) {
+                        $DatabaseName = $Mbx.Database.Name
+                    }
+                    elseif ($Mbx.Database -is [string]) {
+                        $DatabaseName = $Mbx.Database
+                    }
+                    else {
+                        $DatabaseName = $Mbx.Database.ToString()
+                    }
+                }
+                
+                # Method 2: Try to get from full object
+                if ($DatabaseName -eq "Not Assigned") {
+                    try {
+                        $MbxDetail = Get-Mailbox -Identity $Mbx.Identity -ErrorAction SilentlyContinue
+                        if ($MbxDetail.Database) {
+                            if ($MbxDetail.Database.Name) {
+                                $DatabaseName = $MbxDetail.Database.Name
+                            }
+                            else {
+                                $DatabaseName = $MbxDetail.Database.ToString()
+                            }
+                        }
+                    }
+                    catch {
+                        # Keep "Not Assigned"
+                    }
+                }
+                
                 $Results.SystemMailboxes += [PSCustomObject]@{
                     Type = "Monitoring"
                     Name = $Mbx.Name
-                    Database = $Mbx.Database.Name
+                    Database = $DatabaseName
                     Status = "OK"
                 }
             }
+            
             foreach ($Mbx in $AuditLog) {
+                # FIXED: Properly get database name with multiple methods
+                $DatabaseName = "Not Assigned"
+                
+                # Method 1: Check Database.Name property
+                if ($Mbx.Database) {
+                    if ($Mbx.Database.Name) {
+                        $DatabaseName = $Mbx.Database.Name
+                    }
+                    elseif ($Mbx.Database -is [string]) {
+                        $DatabaseName = $Mbx.Database
+                    }
+                    else {
+                        $DatabaseName = $Mbx.Database.ToString()
+                    }
+                }
+                
+                # Method 2: Try to get from full object
+                if ($DatabaseName -eq "Not Assigned") {
+                    try {
+                        $MbxDetail = Get-Mailbox -Identity $Mbx.Identity -ErrorAction SilentlyContinue
+                        if ($MbxDetail.Database) {
+                            if ($MbxDetail.Database.Name) {
+                                $DatabaseName = $MbxDetail.Database.Name
+                            }
+                            else {
+                                $DatabaseName = $MbxDetail.Database.ToString()
+                            }
+                        }
+                    }
+                    catch {
+                        # Keep "Not Assigned"
+                    }
+                }
+                
                 $Results.SystemMailboxes += [PSCustomObject]@{
                     Type = "Audit Log"
                     Name = $Mbx.Name
-                    Database = $Mbx.Database.Name
+                    Database = $DatabaseName
                     Status = "OK"
                 }
             }
-        } catch {}
+        } catch {
+            # If query fails, add error entry
+            $Results.SystemMailboxes += [PSCustomObject]@{
+                Type = "Error"
+                Name = "Failed to retrieve system mailboxes"
+                Database = $_.Exception.Message
+                Status = "Failed"
+            }
+        }
         try {
             $OWA = Get-OwaVirtualDirectory -ErrorAction SilentlyContinue
             $EWS = Get-WebServicesVirtualDirectory -ErrorAction SilentlyContinue
@@ -1453,20 +1688,86 @@ function Test-ExchangeComprehensive {
             }
         } catch {}
         try {
+            # REAL FIX: Force Services property evaluation in remote context
+            $CertResults = @()
             $Certs = Get-ExchangeCertificate -ErrorAction SilentlyContinue
+            
             foreach ($Cert in $Certs) {
                 $DaysToExpire = ($Cert.NotAfter - (Get-Date)).Days
-                $Status = if ($DaysToExpire -lt $Script:Thresholds.CertificateExpiryWarningDays) { "Expiring Soon" } elseif ($DaysToExpire -lt 0) { "EXPIRED" } else { "Valid" }
-                $Results.Certificates += [PSCustomObject]@{
-                    Subject = $Cert.Subject
-                    Thumbprint = $Cert.Thumbprint
-                    NotAfter = $Cert.NotAfter
-                    DaysToExpire = $DaysToExpire
-                    Services = $Cert.Services
-                    Status = $Status
+                $Status = if ($DaysToExpire -lt 30) { 
+                    if ($DaysToExpire -lt 0) { "EXPIRED" } else { "Expiring Soon" }
+                } else { 
+                    "Valid" 
+                }
+                
+                # CRITICAL: Capture Services as STRING immediately
+                $ServicesString = $(
+                    try {
+                        $SvcProp = $null
+                        
+                        # Method 1: Direct property access
+                        if ($Cert.Services) {
+                            $SvcProp = $Cert.Services
+                        }
+                        
+                        # Method 2: Use PSObject.Properties
+                        if (-not $SvcProp) {
+                            $SvcProperty = $Cert.PSObject.Properties | Where-Object { $_.Name -eq 'Services' }
+                            if ($SvcProperty) {
+                                $SvcProp = $SvcProperty.Value
+                            }
+                        }
+                        
+                        # Convert to string
+                        if ($SvcProp) {
+                            $SvcString = [string]$SvcProp
+                            if ($SvcString -and $SvcString -ne "None" -and $SvcString -ne "0") {
+                                $SvcString
+                            } else {
+                                if ($Cert.IsSelfSigned) { "Self-Signed" } else { "Not Assigned" }
+                            }
+                        } else {
+                            if ($Cert.IsSelfSigned) { "Self-Signed" } else { "Not Assigned" }
+                        }
+                    }
+                    catch {
+                        "Error: $($_.Exception.Message)"
+                    }
+                )
+                
+                # Create object with STRING properties only
+                $CertResults += [PSCustomObject]@{
+                    Subject = [string]$Cert.Subject
+                    Thumbprint = [string]$Cert.Thumbprint
+                    NotAfter = [string]$Cert.NotAfter
+                    DaysToExpire = [int]$DaysToExpire
+                    Status = [string]$Status
                 }
             }
-        } catch {}
+            
+            # Add all cert results to main results
+            foreach ($CertResult in $CertResults) {
+                $Results.Certificates += $CertResult
+            }
+            
+        } catch {
+            $Results.Certificates += [PSCustomObject]@{
+                Subject = "Error retrieving certificates"
+                Thumbprint = [string]$_.Exception.Message
+                NotAfter = ""
+                DaysToExpire = 0
+                Status = "Failed"
+            }
+        }
+            # If certificate query fails, add error entry
+            $Results.Certificates += [PSCustomObject]@{
+                Subject = "Error retrieving certificates"
+                Thumbprint = $_.Exception.Message
+                NotAfter = ""
+                DaysToExpire = 0
+                Services = "N/A"
+                Status = "Failed"
+            }
         try {
             $Connectors = Get-SendConnector -ErrorAction SilentlyContinue
             foreach ($Conn in $Connectors) {
@@ -1484,24 +1785,155 @@ function Test-ExchangeComprehensive {
         } catch {}
         try {
             $DAGs = Get-DatabaseAvailabilityGroup -ErrorAction SilentlyContinue
-            foreach ($DAG in $DAGs) {
-                $Members = if ($DAG.Servers) { ($DAG.Servers.Name -join ", ") } else { "None" }
-                $Results.DAG += [PSCustomObject]@{
-                    DAGName = $DAG.Name
-                    Members = $Members
-                    WitnessServer = $DAG.WitnessServer
-                    Status = "OK"
+            
+            if ($DAGs) {
+                foreach ($DAG in $DAGs) {
+                    # FIXED: Properly get DAG members with multiple methods
+                    $MembersText = "No Members"
+                    
+                    # Method 1: Check Servers property and get names
+                    if ($DAG.Servers) {
+                        if ($DAG.Servers.Count -gt 0) {
+                            $ServerNames = @()
+                            
+                            foreach ($Server in $DAG.Servers) {
+                                if ($Server.Name) {
+                                    # Clean up FQDN - keep just hostname
+                                    $ServerName = $Server.Name
+                                    if ($ServerName -like "*.*") {
+                                        $ServerName = $ServerName.Split('.')[0]
+                                    }
+                                    $ServerNames += $ServerName
+                                }
+                                elseif ($Server -is [string]) {
+                                    # Server is already a string
+                                    $ServerName = $Server
+                                    if ($ServerName -like "*.*") {
+                                        $ServerName = $ServerName.Split('.')[0]
+                                    }
+                                    $ServerNames += $ServerName
+                                }
+                                else {
+                                    # Try ToString()
+                                    $ServerName = $Server.ToString()
+                                    if ($ServerName -like "*.*") {
+                                        $ServerName = $ServerName.Split('.')[0]
+                                    }
+                                    $ServerNames += $ServerName
+                                }
+                            }
+                            
+                            if ($ServerNames.Count -gt 0) {
+                                $MembersText = $ServerNames -join ", "
+                            }
+                        }
+                    }
+                    
+                    # Method 2: If still no members, try OperationalServers
+                    if ($MembersText -eq "No Members" -and $DAG.OperationalServers) {
+                        $OperationalNames = @()
+                        foreach ($OpServer in $DAG.OperationalServers) {
+                            if ($OpServer.Name) {
+                                $ServerName = $OpServer.Name
+                                if ($ServerName -like "*.*") {
+                                    $ServerName = $ServerName.Split('.')[0]
+                                }
+                                $OperationalNames += $ServerName
+                            }
+                        }
+                        if ($OperationalNames.Count -gt 0) {
+                            $MembersText = $OperationalNames -join ", "
+                        }
+                    }
+                    
+                    # Method 3: If still no members, try to query the DAG again with -Status
+                    if ($MembersText -eq "No Members") {
+                        try {
+                            $DAGDetail = Get-DatabaseAvailabilityGroup -Identity $DAG.Name -Status -ErrorAction SilentlyContinue
+                            if ($DAGDetail.Servers) {
+                                $ServerNames = @()
+                                foreach ($Server in $DAGDetail.Servers) {
+                                    if ($Server.Name) {
+                                        $ServerName = $Server.Name
+                                        if ($ServerName -like "*.*") {
+                                            $ServerName = $ServerName.Split('.')[0]
+                                        }
+                                        $ServerNames += $ServerName
+                                    }
+                                }
+                                if ($ServerNames.Count -gt 0) {
+                                    $MembersText = $ServerNames -join ", "
+                                }
+                            }
+                        }
+                        catch {
+                            # Keep "No Members"
+                        }
+                    }
+                    
+                    # FIXED: Properly get WitnessServer with multiple methods
+                    $WitnessText = "Not Set"
+                    
+                    # Method 1: Direct property
+                    if ($DAG.WitnessServer) {
+                        if ($DAG.WitnessServer.Name) {
+                            $WitnessText = $DAG.WitnessServer.Name
+                        }
+                        elseif ($DAG.WitnessServer -is [string]) {
+                            $WitnessText = $DAG.WitnessServer
+                        }
+                        else {
+                            $WitnessText = $DAG.WitnessServer.ToString()
+                        }
+                        
+                        # Clean up FQDN
+                        if ($WitnessText -like "*.*") {
+                            $WitnessText = $WitnessText.Split('.')[0]
+                        }
+                    }
+                    
+                    # Method 2: Try AlternateWitnessServer if primary is not set
+                    if ($WitnessText -eq "Not Set" -and $DAG.AlternateWitnessServer) {
+                        if ($DAG.AlternateWitnessServer.Name) {
+                            $WitnessText = $DAG.AlternateWitnessServer.Name + " (Alternate)"
+                        }
+                        else {
+                            $WitnessText = $DAG.AlternateWitnessServer.ToString() + " (Alternate)"
+                        }
+                        
+                        # Clean up FQDN
+                        if ($WitnessText -like "*.*") {
+                            $Parts = $WitnessText.Split('.')
+                            $WitnessText = $Parts[0] + " (Alternate)"
+                        }
+                    }
+                    
+                    $Results.DAG += [PSCustomObject]@{
+                        DAGName = $DAG.Name
+                        Members = $MembersText
+                        WitnessServer = $WitnessText
+                        Status = "OK"
+                    }
                 }
             }
-            if ($DAGs.Count -eq 0) {
+            else {
+                # No DAG configured
                 $Results.DAG += [PSCustomObject]@{
                     DAGName = "No DAG Configured"
-                    Members = ""
-                    WitnessServer = ""
+                    Members = "N/A"
+                    WitnessServer = "N/A"
                     Status = "Info"
                 }
             }
-        } catch {}
+        } catch {
+            # If DAG query fails, add error entry
+            $Results.DAG += [PSCustomObject]@{
+                DAGName = "Error retrieving DAG"
+                Members = $_.Exception.Message
+                WitnessServer = "N/A"
+                Status = "Failed"
+            }
+        }
         try {
             $ExchServer = Get-ExchangeServer -Identity $env:COMPUTERNAME -ErrorAction Stop
             $Results.General += [PSCustomObject]@{
@@ -3997,7 +4429,7 @@ function Show-ValidationGUI {
         [System.GC]::Collect()
         [System.GC]::WaitForPendingFinalizers()
     })
-    $Global:MainForm.Text = "Infrastructure Validation Tool v2.4"
+    $Global:MainForm.Text = "Infrastructure Validation Tool v1.0"
     $Global:MainForm.Size = New-Object System.Drawing.Size(1500, 900)
     $Global:MainForm.StartPosition = "CenterScreen"
     $Global:MainForm.BackColor = [System.Drawing.Color]::FromArgb(240, 240, 240)
@@ -4012,7 +4444,7 @@ function Show-ValidationGUI {
     $TitleLabel.Location = New-Object System.Drawing.Point(20, 20)
     $Global:MainForm.Controls.Add($TitleLabel)
     $SubtitleLabel = New-Object System.Windows.Forms.Label
-    $SubtitleLabel.Text = "Excel-Style Table Display with Comprehensive Exchange Validation"
+    $SubtitleLabel.Text = "Professional Infrastructure Health Assessment and Documentation Tool"
     $SubtitleLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10)
     $SubtitleLabel.ForeColor = $Script:Colors.GridHeader
     $SubtitleLabel.AutoSize = $true
@@ -4232,7 +4664,7 @@ function Show-ValidationGUI {
     $HeaderPanel.Controls.Add($TitleLabel)
     
     $VersionLabel = New-Object System.Windows.Forms.Label
-    $VersionLabel.Text = "Version 2.4  |  Created by: Hisham Nasur - NourNet - MS-TEAM1"
+    $VersionLabel.Text = "Version 1.0  |  Created by: Hisham Nasur - NN - MS Operation"
     $VersionLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10)
     $VersionLabel.ForeColor = [System.Drawing.Color]::FromArgb(189, 195, 199)
     $VersionLabel.Location = New-Object System.Drawing.Point(35, 60)
