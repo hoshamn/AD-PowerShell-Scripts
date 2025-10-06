@@ -1023,6 +1023,7 @@ function Test-ServerConnection {
     }
 }
 
+<#
 function Invoke-SafeRemoteCommand {
     param(
         [string]$ServerName,
@@ -1046,6 +1047,44 @@ function Invoke-SafeRemoteCommand {
         return @{ Success = $false; Data = $null; Error = $_.Exception.Message }
     }
 }
+#>
+function Invoke-SafeRemoteCommand {
+    param(
+        [string]$ServerName,
+        [scriptblock]$ScriptBlock,
+        [System.Management.Automation.PSCredential]$Credential,
+        [int]$TimeoutSeconds = 300
+    )
+    
+    if (-not $Credential) {
+        return @{ 
+            Success = $false
+            Data = $null
+            Error = "No credentials provided"
+            ErrorCode = "AUTH_REQUIRED"
+        }
+    }
+    
+    try {
+        $Result = Invoke-Command -ComputerName $ServerName -ScriptBlock $ScriptBlock -Credential $Credential -ErrorAction Stop
+        
+        return @{ 
+            Success = $true
+            Data = $Result
+            Error = $null
+            ErrorCode = $null
+        }
+    }
+    catch {
+        return @{
+            Success = $false
+            Data = $null
+            Error = $_.Exception.Message
+            ErrorCode = "EXECUTION_ERROR"
+        }
+    }
+}
+
 
 function Connect-ExchangeRemote {
     param([string]$ServerName, [System.Management.Automation.PSCredential]$Credential)
@@ -2005,6 +2044,728 @@ function Test-ExchangeComprehensive {
     }
 }
 
+#region Azure AD Connect Validation Functions
+
+<#
+.SYNOPSIS
+    Validates Azure AD Connect/Entra Connect installation and configuration
+.DESCRIPTION
+    Comprehensive validation of AAD Connect sync service, health, configuration, and connectors
+#>
+
+function Test-ADConnectPermissions {
+    param(
+        [string]$ServerName,
+        [System.Management.Automation.PSCredential]$Credential
+    )
+    
+    $Results = @{
+        HasPermission = $false
+        MissingPermissions = @()
+        Details = @()
+    }
+    
+    try {
+        $Results.Details += "Target Server: $ServerName"
+        $Results.Details += "Checking remote PowerShell access..."
+        
+        $ConnectivityTest = Invoke-SafeRemoteCommand -ServerName $ServerName -Credential $Credential -ScriptBlock {
+            return @{ 
+                ComputerName = $env:COMPUTERNAME
+                PowerShellVersion = $PSVersionTable.PSVersion.ToString()
+            }
+        }
+        
+        if (-not $ConnectivityTest.Success) {
+            $Results.MissingPermissions += "Cannot establish remote PowerShell session"
+            $Results.Details += "Remote PS Error: $($ConnectivityTest.Error)"
+            return $Results
+        }
+        else {
+            $Results.Details += "[OK] Remote PowerShell access successful"
+            $Results.Details += "Connected to: $($ConnectivityTest.Data.ComputerName)"
+            $Results.Details += "PowerShell Version: $($ConnectivityTest.Data.PowerShellVersion)"
+        }
+        
+        $Results.Details += "Checking for ADSync PowerShell module..."
+        
+        $ModuleCheck = Invoke-SafeRemoteCommand -ServerName $ServerName -Credential $Credential -ScriptBlock {
+            $Module = Get-Module -ListAvailable -Name ADSync -ErrorAction SilentlyContinue
+            if ($Module) {
+                return @{ Found = $true; Version = $Module.Version.ToString() }
+            } else {
+                return @{ Found = $false }
+            }
+        }
+        
+        if ($ModuleCheck.Success -and $ModuleCheck.Data.Found) {
+            $Results.Details += "[OK] Found ADSync module version $($ModuleCheck.Data.Version)"
+        }
+        else {
+            $Results.MissingPermissions += "ADSync PowerShell module not found"
+            $Results.Details += "[FAIL] ADSync module is NOT installed on this server"
+            return $Results
+        }
+        
+        $Results.Details += "Checking ADSync configuration access..."
+        
+        $ConfigCheck = Invoke-SafeRemoteCommand -ServerName $ServerName -Credential $Credential -ScriptBlock {
+            try {
+                Import-Module ADSync -ErrorAction Stop
+                $Scheduler = Get-ADSyncScheduler -ErrorAction Stop
+                return @{ Success = $true; Enabled = $Scheduler.SyncCycleEnabled }
+            }
+            catch {
+                return @{ Success = $false; Error = $_.Exception.Message }
+            }
+        }
+        
+        if ($ConfigCheck.Success -and $ConfigCheck.Data.Success) {
+            $Results.Details += "[OK] Accessed ADSync configuration"
+            $Results.Details += "Sync enabled: $($ConfigCheck.Data.Enabled)"
+            $Results.HasPermission = $true
+        }
+        else {
+            $Results.MissingPermissions += "Cannot access ADSync configuration"
+            $Results.Details += "[FAIL] Failed to access ADSync configuration"
+            if ($ConfigCheck.Data.Error) { $Results.Details += "Error: $($ConfigCheck.Data.Error)" }
+        }
+        
+        $Results.Details += "Checking ADSync service status..."
+        
+        $ServiceCheck = Invoke-SafeRemoteCommand -ServerName $ServerName -Credential $Credential -ScriptBlock {
+            try {
+                $Service = Get-Service -Name ADSync -ErrorAction Stop
+                return @{ Success = $true; Status = $Service.Status.ToString() }
+            }
+            catch {
+                return @{ Success = $false; Error = $_.Exception.Message }
+            }
+        }
+        
+        if ($ServiceCheck.Success -and $ServiceCheck.Data.Success) {
+            $Results.Details += "[OK] ADSync service status: $($ServiceCheck.Data.Status)"
+            $Results.HasPermission = $true
+        }
+        else {
+            $Results.MissingPermissions += "Cannot access ADSync service"
+            $Results.Details += "[FAIL] Failed to check ADSync service status"
+        }
+    }
+    catch {
+        $Results.MissingPermissions += "Exception: $($_.Exception.Message)"
+        $Results.Details += "Critical error: $($_.Exception.Message)"
+    }
+    
+    return $Results
+}
+
+
+
+
+function Get-ADConnectVersion {
+    <#
+    .SYNOPSIS
+        Retrieves Azure AD Connect version and build information
+    #>
+    param(
+        [string]$ServerName,
+        [System.Management.Automation.PSCredential]$Credential
+    )
+    
+    $Result = Invoke-SafeRemoteCommand -ServerName $ServerName -Credential $Credential -ScriptBlock {
+        try {
+            Import-Module ADSync -ErrorAction Stop
+            
+            # Method 1: Get version from global settings
+            $VersionParam = Get-ADSyncGlobalSettingsParameter | 
+                Where-Object { $_.Name -eq 'Microsoft.Synchronize.ServerConfigurationVersion' }
+            
+            if ($VersionParam) {
+                $Version = $VersionParam.Value
+            }
+            
+            # Method 2: Fallback to registry
+            if (-not $Version) {
+                $RegPath = "HKLM:\SOFTWARE\Microsoft\Azure AD Connect"
+                if (Test-Path $RegPath) {
+                    $Version = (Get-ItemProperty -Path $RegPath -Name "Version" -ErrorAction SilentlyContinue).Version
+                }
+            }
+            
+            # Get installation date
+            $InstallDate = $null
+            $SetupRegPath = "HKLM:\SOFTWARE\Microsoft\Azure AD Connect\Setup"
+            if (Test-Path $SetupRegPath) {
+                $InstallDate = (Get-ItemProperty -Path $SetupRegPath -Name "InstallationDate" -ErrorAction SilentlyContinue).InstallationDate
+            }
+            
+            return @{
+                Version = $Version
+                InstallDate = $InstallDate
+                ComputerName = $env:COMPUTERNAME
+            }
+        }
+        catch {
+            return @{ Error = $_.Exception.Message }
+        }
+    }
+    
+    return $Result
+}
+
+function Get-ADConnectServiceStatus {
+    param(
+        [string]$ServerName,
+        [System.Management.Automation.PSCredential]$Credential
+    )
+    
+    $Result = Invoke-SafeRemoteCommand -ServerName $ServerName -Credential $Credential -ScriptBlock {
+        $Services = @("ADSync")
+        $ServiceStatus = @()
+        
+        foreach ($SvcName in $Services) {
+            try {
+                $Service = Get-Service -Name $SvcName -ErrorAction SilentlyContinue
+                
+                if ($Service) {
+                    # CRITICAL: Create a simple hashtable with string values
+                    $ServiceStatus += New-Object PSObject -Property @{
+                        ServiceName = $SvcName
+                        DisplayName = $Service.DisplayName
+                        Status = $Service.Status.ToString()  # Convert enum to string
+                        StartType = $Service.StartType.ToString()  # Convert enum to string
+                    }
+                } else {
+                    $ServiceStatus += New-Object PSObject -Property @{
+                        ServiceName = $SvcName
+                        DisplayName = "Microsoft Azure AD Sync"
+                        Status = "Not Found"
+                        StartType = "N/A"
+                    }
+                }
+            }
+            catch {
+                $ServiceStatus += New-Object PSObject -Property @{
+                    ServiceName = $SvcName
+                    DisplayName = "Microsoft Azure AD Sync"
+                    Status = "Error"
+                    StartType = "N/A"
+                }
+            }
+        }
+        
+        # Return only the properties we need as strings
+        return $ServiceStatus | Select-Object ServiceName, DisplayName, Status, StartType
+    }
+    
+    return $Result
+}
+
+
+function Get-ADConnectSyncScheduler {
+    param(
+        [string]$ServerName,
+        [System.Management.Automation.PSCredential]$Credential
+    )
+    
+    $Result = Invoke-SafeRemoteCommand -ServerName $ServerName -Credential $Credential -ScriptBlock {
+        try {
+            Import-Module ADSync -ErrorAction Stop
+            $Scheduler = Get-ADSyncScheduler -ErrorAction Stop
+            
+            # Build simple string-based objects
+            $SchedulerData = @()
+            
+            $SchedulerData += New-Object PSObject -Property @{
+                Property = "Sync Cycle Enabled"
+                Value = $Scheduler.SyncCycleEnabled.ToString()
+                Status = if ($Scheduler.SyncCycleEnabled) { "Enabled" } else { "Disabled" }
+            }
+            
+            $SchedulerData += New-Object PSObject -Property @{
+                Property = "Sync Interval"
+                Value = $Scheduler.CurrentlyEffectiveSyncCycleInterval.ToString()
+                Status = "Active"
+            }
+            
+            $SchedulerData += New-Object PSObject -Property @{
+                Property = "Next Sync Time"
+                Value = if ($Scheduler.NextSyncCycleStartTimeInUTC) { 
+                    $Scheduler.NextSyncCycleStartTimeInUTC.ToString("yyyy-MM-dd HH:mm:ss") 
+                } else { 
+                    "Not Scheduled" 
+                }
+                Status = "Scheduled"
+            }
+            
+            $SchedulerData += New-Object PSObject -Property @{
+                Property = "Sync In Progress"
+                Value = $Scheduler.SyncCycleInProgress.ToString()
+                Status = if ($Scheduler.SyncCycleInProgress) { "Running" } else { "Idle" }
+            }
+            
+            $SchedulerData += New-Object PSObject -Property @{
+                Property = "Staging Mode"
+                Value = $Scheduler.StagingModeEnabled.ToString()
+                Status = if ($Scheduler.StagingModeEnabled) { "Enabled (READ-ONLY)" } else { "Disabled" }
+            }
+            
+            return $SchedulerData | Select-Object Property, Value, Status
+        }
+        catch {
+            return @(New-Object PSObject -Property @{
+                Property = "Error"
+                Value = $_.Exception.Message
+                Status = "Error"
+            }) | Select-Object Property, Value, Status
+        }
+    }
+    
+    return $Result
+}
+
+
+
+function Get-ADConnectConnectors {
+    param(
+        [string]$ServerName,
+        [System.Management.Automation.PSCredential]$Credential
+    )
+    
+    $Result = Invoke-SafeRemoteCommand -ServerName $ServerName -Credential $Credential -ScriptBlock {
+        try {
+            Import-Module ADSync -ErrorAction Stop
+            $Connectors = Get-ADSyncConnector -ErrorAction Stop
+            
+            $ConnectorInfo = @()
+            
+            foreach ($Connector in $Connectors) {
+                $ConnectorInfo += New-Object PSObject -Property @{
+                    Name = $Connector.Name
+                    Type = $Connector.ConnectorType.ToString()
+                    Subtype = if ($Connector.Subtype) { $Connector.Subtype.ToString() } else { "N/A" }
+                    Description = if ($Connector.Description) { $Connector.Description } else { "N/A" }
+                }
+            }
+            
+            return $ConnectorInfo | Select-Object Name, Type, Subtype, Description
+        }
+        catch {
+            return @(New-Object PSObject -Property @{
+                Name = "Error"
+                Type = $_.Exception.Message
+                Subtype = "N/A"
+                Description = "Failed to retrieve connectors"
+            }) | Select-Object Name, Type, Subtype, Description
+        }
+    }
+    
+    return $Result
+}
+
+
+
+function Get-ADConnectSyncHistory {
+    param(
+        [string]$ServerName,
+        [System.Management.Automation.PSCredential]$Credential,
+        [int]$NumberOfRuns = 10
+    )
+    
+    $Result = Invoke-SafeRemoteCommand -ServerName $ServerName -Credential $Credential -ScriptBlock {
+        param($NumRuns)
+        
+        try {
+            Import-Module ADSync -ErrorAction Stop
+            $RunHistory = Get-ADSyncRunProfileResult -NumberRequested $NumRuns -ErrorAction Stop
+            
+            $HistoryInfo = @()
+            
+            foreach ($Run in $RunHistory) {
+                $TotalAdds = 0
+                $TotalUpdates = 0
+                $TotalDeletes = 0
+                $TotalErrors = 0
+                
+                foreach ($Step in $Run.RunStepResults) {
+                    $TotalAdds += $Step.NumberOfStepAdds
+                    $TotalUpdates += $Step.NumberOfStepUpdates
+                    $TotalDeletes += $Step.NumberOfStepDeletes
+                    if ($Step.StepErrorCount -gt 0) {
+                        $TotalErrors += $Step.StepErrorCount
+                    }
+                }
+                
+                $HistoryInfo += New-Object PSObject -Property @{
+                    RunDate = if ($Run.StartDate) { $Run.StartDate.ToString("yyyy-MM-dd HH:mm:ss") } else { "Unknown" }
+                    ConnectorName = $Run.ConnectorName
+                    RunProfileName = $Run.RunProfileName
+                    Result = $Run.Result.ToString()
+                    Adds = $TotalAdds.ToString()
+                    Updates = $TotalUpdates.ToString()
+                    Deletes = $TotalDeletes.ToString()
+                    Errors = $TotalErrors.ToString()
+                }
+            }
+            
+            return $HistoryInfo | Select-Object RunDate, ConnectorName, RunProfileName, Result, Adds, Updates, Deletes, Errors
+        }
+        catch {
+            return @(New-Object PSObject -Property @{
+                RunDate = "Error"
+                ConnectorName = $_.Exception.Message
+                RunProfileName = "N/A"
+                Result = "Error"
+                Adds = "0"
+                Updates = "0"
+                Deletes = "0"
+                Errors = "0"
+            }) | Select-Object RunDate, ConnectorName, RunProfileName, Result, Adds, Updates, Deletes, Errors
+        }
+    } -ArgumentList $NumberOfRuns
+    
+    return $Result
+}
+
+
+
+function Get-ADConnectSyncErrors {
+    <#
+    .SYNOPSIS
+        Retrieves current synchronization errors
+    #>
+    param(
+        [string]$ServerName,
+        [System.Management.Automation.PSCredential]$Credential
+    )
+    
+    $Result = Invoke-SafeRemoteCommand -ServerName $ServerName -Credential $Credential -ScriptBlock {
+        try {
+            Import-Module ADSync -ErrorAction Stop
+            
+            # Get connector space objects with errors
+            $Connectors = Get-ADSyncConnector
+            $Errors = @()
+            
+            foreach ($Connector in $Connectors) {
+                try {
+                    # Search for objects with sync errors
+                    $CSObjects = Get-ADSyncCSObject -ConnectorName $Connector.Name -ErrorAction SilentlyContinue | 
+                        Where-Object { $_.SerializedXml -like "*error*" } |
+                        Select-Object -First 50
+                    
+                    foreach ($CSObject in $CSObjects) {
+                        $Errors += [PSCustomObject]@{
+                            ConnectorName = $Connector.Name
+                            ObjectType = $CSObject.ObjectType
+                            DistinguishedName = $CSObject.DistinguishedName
+                            ObjectId = $CSObject.ObjectId
+                            ConnectorSpaceState = $CSObject.ConnectorSpaceState
+                        }
+                    }
+                }
+                catch {
+                    # Silently continue if connector space search fails
+                    continue
+                }
+            }
+            
+            # Also check for import/export errors from last run
+            $LastRuns = Get-ADSyncRunProfileResult -NumberRequested 5
+            
+            foreach ($Run in $LastRuns) {
+                if ($Run.Result -ne 'success') {
+                    foreach ($Step in $Run.RunStepResults) {
+                        if ($Step.StepErrorCount -gt 0) {
+                            $Errors += [PSCustomObject]@{
+                                ConnectorName = $Run.ConnectorName
+                                ObjectType = "Run Error"
+                                DistinguishedName = "N/A"
+                                ObjectId = "Run: $($Run.RunNumber)"
+                                ConnectorSpaceState = "Error Count: $($Step.StepErrorCount)"
+                            }
+                        }
+                    }
+                }
+            }
+            
+            return $Errors
+        }
+        catch {
+            return @{ Error = $_.Exception.Message }
+        }
+    }
+    
+    return $Result
+}
+
+function Get-ADConnectGlobalSettings {
+    <#
+    .SYNOPSIS
+        Retrieves global AAD Connect configuration settings
+    #>
+    param(
+        [string]$ServerName,
+        [System.Management.Automation.PSCredential]$Credential
+    )
+    
+    $Result = Invoke-SafeRemoteCommand -ServerName $ServerName -Credential $Credential -ScriptBlock {
+        try {
+            Import-Module ADSync -ErrorAction Stop
+            
+            $GlobalSettings = Get-ADSyncGlobalSettings -ErrorAction Stop
+            $Parameters = Get-ADSyncGlobalSettingsParameter -ErrorAction Stop
+            
+            # Extract key parameters
+            $Config = @{
+                Version = ($Parameters | Where-Object { $_.Name -eq 'Microsoft.Synchronize.ServerConfigurationVersion' }).Value
+                SourceAnchor = ($Parameters | Where-Object { $_.Name -eq 'Microsoft.Synchronize.SourceAnchor' }).Value
+                PasswordSyncEnabled = ($Parameters | Where-Object { $_.Name -like '*PasswordSync*' }).Value
+                WritebackEnabled = ($Parameters | Where-Object { $_.Name -like '*Writeback*' }).Value
+            }
+            
+            return [PSCustomObject]@{
+                InstanceId = $GlobalSettings.InstanceId
+                Version = $Config.Version
+                SourceAnchorAttribute = $Config.SourceAnchor
+                Parameters = $Parameters | Select-Object Name, Value
+            }
+        }
+        catch {
+            return @{ Error = $_.Exception.Message }
+        }
+    }
+    
+    return $Result
+}
+
+function Get-ADConnectMetrics {
+    <#
+    .SYNOPSIS
+        Retrieves synchronization metrics and statistics
+    #>
+    param(
+        [string]$ServerName,
+        [System.Management.Automation.PSCredential]$Credential
+    )
+    
+    $Result = Invoke-SafeRemoteCommand -ServerName $ServerName -Credential $Credential -ScriptBlock {
+        try {
+            Import-Module ADSync -ErrorAction Stop
+            
+            $Connectors = Get-ADSyncConnector
+            $Metrics = @()
+            
+            foreach ($Connector in $Connectors) {
+                try {
+                    $CSStatistics = Get-ADSyncCSObjectStatistics -ConnectorName $Connector.Name -ErrorAction SilentlyContinue
+                    
+                    if ($CSStatistics) {
+                        $Metrics += [PSCustomObject]@{
+                            ConnectorName = $Connector.Name
+                            ConnectorType = $Connector.ConnectorType
+                            TotalObjects = ($CSStatistics | Measure-Object -Property Count -Sum).Sum
+                            ObjectTypes = ($CSStatistics | Select-Object -ExpandProperty ObjectType | Sort-Object -Unique) -join ", "
+                        }
+                    }
+                }
+                catch {
+                    $Metrics += [PSCustomObject]@{
+                        ConnectorName = $Connector.Name
+                        ConnectorType = $Connector.ConnectorType
+                        TotalObjects = "Error retrieving"
+                        ObjectTypes = "N/A"
+                    }
+                }
+            }
+            
+            # Get metaverse statistics
+            try {
+                $MVStatistics = Get-ADSyncMVObjectStatistics -ErrorAction SilentlyContinue
+                
+                $MetaverseInfo = [PSCustomObject]@{
+                    ConnectorName = "Metaverse"
+                    ConnectorType = "Metaverse"
+                    TotalObjects = ($MVStatistics | Measure-Object -Property Count -Sum).Sum
+                    ObjectTypes = ($MVStatistics | Select-Object -ExpandProperty ObjectType | Sort-Object -Unique) -join ", "
+                }
+                
+                $Metrics += $MetaverseInfo
+            }
+            catch {
+                # Metaverse stats not available
+            }
+            
+            return $Metrics
+        }
+        catch {
+            return @{ Error = $_.Exception.Message }
+        }
+    }
+    
+    return $Result
+}
+
+function Test-ADConnectComprehensive {
+    <#
+    .SYNOPSIS
+        Performs comprehensive Azure AD Connect validation
+    .DESCRIPTION
+        Validates all aspects of AAD Connect including service, sync health, connectors, and errors
+    #>
+    param(
+        [string]$ServerName,
+        [System.Management.Automation.PSCredential]$Credential
+    )
+    
+    $Results = @{
+        Version = @()
+        Service = @()
+        Scheduler = @()
+        Connectors = @()
+        SyncHistory = @()
+        SyncErrors = @()
+        GlobalSettings = @()
+        Metrics = @()
+        Summary = @()
+    }
+    
+    try {
+        Write-Verbose "Starting Azure AD Connect validation on $ServerName"
+        
+        # 1. Version Information
+        $VersionInfo = Get-ADConnectVersion -ServerName $ServerName -Credential $Credential
+        if ($VersionInfo.Success) {
+            $Results.Version = @([PSCustomObject]@{
+                Component = "Azure AD Connect"
+                Version = $VersionInfo.Data.Version
+                InstallDate = $VersionInfo.Data.InstallDate
+                Server = $VersionInfo.Data.ComputerName
+            })
+        } else {
+            $Results.Version = @([PSCustomObject]@{
+                Component = "Azure AD Connect"
+                Version = "Error: $($VersionInfo.Error)"
+                InstallDate = "N/A"
+                Server = $ServerName
+            })
+        }
+        
+        # 2. Service Status
+        $ServiceInfo = Get-ADConnectServiceStatus -ServerName $ServerName -Credential $Credential
+        if ($ServiceInfo.Success) {
+            $Results.Service = $ServiceInfo.Data
+        }
+        
+        # 3. Sync Scheduler Configuration
+        $SchedulerInfo = Get-ADConnectSyncScheduler -ServerName $ServerName -Credential $Credential
+        if ($SchedulerInfo.Success -and -not $SchedulerInfo.Data.Error) {
+            # Data is already formatted correctly from Get-ADConnectSyncScheduler
+            $Results.Scheduler = $SchedulerInfo.Data
+        }
+
+        
+        # 4. Connectors
+        $ConnectorInfo = Get-ADConnectConnectors -ServerName $ServerName -Credential $Credential
+        if ($ConnectorInfo.Success -and -not $ConnectorInfo.Data.Error) {
+            $Results.Connectors = $ConnectorInfo.Data
+        }
+
+        
+        # 5. Sync History (Last 10 runs)
+        $HistoryInfo = Get-ADConnectSyncHistory -ServerName $ServerName -Credential $Credential -NumberOfRuns 10
+        if ($HistoryInfo.Success -and -not $HistoryInfo.Data.Error) {
+            $Results.SyncHistory = $HistoryInfo.Data
+        }
+        
+        # 6. Sync Errors
+        $ErrorInfo = Get-ADConnectSyncErrors -ServerName $ServerName -Credential $Credential
+        if ($ErrorInfo.Success -and -not $ErrorInfo.Data.Error) {
+            $Results.SyncErrors = $ErrorInfo.Data
+        }
+        
+        # 7. Global Settings
+        $SettingsInfo = Get-ADConnectGlobalSettings -ServerName $ServerName -Credential $Credential
+        if ($SettingsInfo.Success -and -not $SettingsInfo.Data.Error) {
+            $Results.GlobalSettings = @([PSCustomObject]@{
+                Setting = "Instance ID"
+                Value = $SettingsInfo.Data.InstanceId
+            })
+            $Results.GlobalSettings += [PSCustomObject]@{
+                Setting = "Configuration Version"
+                Value = $SettingsInfo.Data.Version
+            }
+            $Results.GlobalSettings += [PSCustomObject]@{
+                Setting = "Source Anchor Attribute"
+                Value = $SettingsInfo.Data.SourceAnchorAttribute
+            }
+        }
+        
+        # 8. Metrics
+        $MetricsInfo = Get-ADConnectMetrics -ServerName $ServerName -Credential $Credential
+        if ($MetricsInfo.Success -and -not $MetricsInfo.Data.Error) {
+            $Results.Metrics = $MetricsInfo.Data
+        }
+        
+        # 9. Generate Summary
+        $TotalErrors = if ($Results.SyncErrors) { $Results.SyncErrors.Count } else { 0 }
+        $LastSyncStatus = if ($Results.SyncHistory -and $Results.SyncHistory.Count -gt 0) { 
+            [string]$Results.SyncHistory[0].Result 
+        } else { 
+            "Unknown" 
+        }
+        $ServiceRunning = if ($Results.Service -and $Results.Service.Count -gt 0) { 
+            ($Results.Service | Where-Object { $_.ServiceName -eq "ADSync" }).Status -eq "Running" 
+        } else { 
+            $false 
+        }
+        
+        $OverallHealth = if ($ServiceRunning -and $LastSyncStatus -eq "success" -and $TotalErrors -eq 0) { 
+            "Healthy" 
+        } else { 
+            "Issues Detected" 
+        }
+        
+        $Results.Summary = @()
+        
+        $Results.Summary += [PSCustomObject]@{
+            Metric = "Overall Health"
+            Value = [string]$OverallHealth
+            Status = if ($OverallHealth -eq "Healthy") { "Success" } else { "Warning" }
+        }
+        
+        $Results.Summary += [PSCustomObject]@{
+            Metric = "Last Sync Result"
+            Value = [string]$LastSyncStatus
+            Status = if ($LastSyncStatus -eq "success") { "Success" } else { "Error" }
+        }
+        
+        $Results.Summary += [PSCustomObject]@{
+            Metric = "Active Errors"
+            Value = [string]$TotalErrors
+            Status = if ($TotalErrors -eq 0) { "Success" } else { "Error" }
+        }
+        
+        $Results.Summary += [PSCustomObject]@{
+            Metric = "Connectors Configured"
+            Value = if ($Results.Connectors) { [string]$Results.Connectors.Count } else { "0" }
+            Status = "Info"
+        }
+
+        
+    }
+    catch {
+        Write-Error "Error during AAD Connect validation: $($_.Exception.Message)"
+    }
+    
+    return $Results
+}
+
+#endregion
+
+
+
 function Test-ActiveDirectoryComprehensive {
     param([string]$ServerName, [System.Management.Automation.PSCredential]$Credential)
     
@@ -2540,20 +3301,152 @@ function Test-ActiveDirectoryComprehensive {
         
         # 15. Verify No Internet Access
         try {
-            $InternetTest = Test-Connection -ComputerName "8.8.8.8" -Count 1 -Quiet -ErrorAction SilentlyContinue
+            # Test actual web browsing capability, not just ICMP ping
+            $InternetTests = @()
+            
+            # Test 1: HTTP/HTTPS to multiple reliable endpoints
+            $TestSites = @(
+                @{URL="http://www.msftconnecttest.com/connecttest.txt"; Name="Microsoft"},
+                @{URL="http://detectportal.firefox.com/success.txt"; Name="Mozilla"},
+                @{URL="http://clients3.google.com/generate_204"; Name="Google"}
+            )
+            
+            $SuccessfulTests = 0
+            $FailedTests = 0
+            $TestDetails = @()
+            
+            foreach ($Site in $TestSites) {
+                try {
+                    $Response = Invoke-WebRequest -Uri $Site.URL -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
+                    if ($Response.StatusCode -eq 200 -or $Response.StatusCode -eq 204) {
+                        $SuccessfulTests++
+                        $TestDetails += "$($Site.Name): Accessible"
+                    }
+                    else {
+                        $FailedTests++
+                        $TestDetails += "$($Site.Name): HTTP $($Response.StatusCode)"
+                    }
+                }
+                catch {
+                    $FailedTests++
+                    $TestDetails += "$($Site.Name): Blocked/Failed"
+                }
+            }
+            
+            # Determine final status
+            if ($SuccessfulTests -eq 0) {
+                # No internet access - COMPLIANT (as expected for secure infrastructure)
+                $Results.InternetAccess += [PSCustomObject]@{
+                    Check = "Web Browsing Test"
+                    Result = "No Internet Access (Compliant)"
+                    Details = "All HTTP/HTTPS requests blocked"
+                    Status = "OK"
+                }
+            }
+            elseif ($SuccessfulTests -eq $TestSites.Count) {
+                # Full internet access - SECURITY RISK
+                $Results.InternetAccess += [PSCustomObject]@{
+                    Check = "Web Browsing Test"
+                    Result = "FULL INTERNET ACCESS DETECTED"
+                    Details = "All test sites accessible: $($TestDetails -join ' | ')"
+                    Status = "SECURITY RISK"
+                }
+            }
+            else {
+                # Partial internet access - WARNING
+                $Results.InternetAccess += [PSCustomObject]@{
+                    Check = "Web Browsing Test"
+                    Result = "Partial Internet Access"
+                    Details = "$SuccessfulTests of $($TestSites.Count) sites accessible: $($TestDetails -join ' | ')"
+                    Status = "WARNING"
+                }
+            }
+            
+            # Test 2: DNS Resolution (can resolve but not browse?)
+            try {
+                $DNSTest = Resolve-DnsName -Name "www.microsoft.com" -Type A -ErrorAction Stop
+                $DNSWorks = $true
+            }
+            catch {
+                $DNSWorks = $false
+            }
+            
             $Results.InternetAccess += [PSCustomObject]@{
-                Check = "Internet Connectivity Test"
-                Target = "8.8.8.8 (Google DNS)"
-                Result = if ($InternetTest) { "HAS INTERNET ACCESS" } else { "No Internet (Compliant)" }
-                Status = if ($InternetTest) { "SECURITY RISK" } else { "OK" }
+                Check = "DNS Resolution"
+                Result = if ($DNSWorks) { "DNS Working" } else { "DNS Blocked/Failed" }
+                Details = if ($DNSWorks) { "Can resolve external domains" } else { "Cannot resolve external domains" }
+                Status = if ($DNSWorks -and $SuccessfulTests -eq 0) { "INFO" } elseif ($DNSWorks) { "OK" } else { "OK" }
+            }
+            
+            # Test 3: Proxy Detection
+            try {
+                $ProxySettings = Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" -ErrorAction SilentlyContinue
+                $ProxyEnabled = $ProxySettings.ProxyEnable -eq 1
+                $ProxyServer = $ProxySettings.ProxyServer
+                
+                if ($ProxyEnabled) {
+                    $Results.InternetAccess += [PSCustomObject]@{
+                        Check = "Proxy Configuration"
+                        Result = "Proxy Configured"
+                        Details = "Proxy Server: $ProxyServer"
+                        Status = "INFO"
+                    }
+                }
+                else {
+                    $Results.InternetAccess += [PSCustomObject]@{
+                        Check = "Proxy Configuration"
+                        Result = "No Proxy Configured"
+                        Details = "Direct connection settings"
+                        Status = "INFO"
+                    }
+                }
+            }
+            catch {
+                $Results.InternetAccess += [PSCustomObject]@{
+                    Check = "Proxy Configuration"
+                    Result = "Unable to check"
+                    Details = "Registry access failed"
+                    Status = "INFO"
+                }
+            }
+            
+            # Test 4: Windows Firewall Status
+            try {
+                $FirewallProfiles = Get-NetFirewallProfile -ErrorAction SilentlyContinue
+                $EnabledProfiles = ($FirewallProfiles | Where-Object { $_.Enabled -eq $true }).Name -join ", "
+                
+                if ($EnabledProfiles) {
+                    $Results.InternetAccess += [PSCustomObject]@{
+                        Check = "Windows Firewall"
+                        Result = "Enabled"
+                        Details = "Active Profiles: $EnabledProfiles"
+                        Status = "OK"
+                    }
+                }
+                else {
+                    $Results.InternetAccess += [PSCustomObject]@{
+                        Check = "Windows Firewall"
+                        Result = "Disabled"
+                        Details = "No firewall profiles active"
+                        Status = "WARNING"
+                    }
+                }
+            }
+            catch {
+                $Results.InternetAccess += [PSCustomObject]@{
+                    Check = "Windows Firewall"
+                    Result = "Unable to check"
+                    Details = $_.Exception.Message
+                    Status = "INFO"
+                }
             }
         }
         catch {
             $Results.InternetAccess += [PSCustomObject]@{
                 Check = "Internet Connectivity Test"
-                Target = "8.8.8.8 (Google DNS)"
-                Result = "No Internet (Compliant)"
-                Status = "OK"
+                Result = "Test Failed"
+                Details = $_.Exception.Message
+                Status = "ERROR"
             }
         }
         
@@ -4243,6 +5136,358 @@ function Show-ADFSResults {
 
 #endregion
 
+function Show-ADConnectResults {
+    if (-not $Script:Credential) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Please connect with credentials first.",
+            "Authentication Required",
+            "OK",
+            "Warning"
+        )
+        return
+    }
+    
+    # Find Azure AD Connect server in inventory
+    $ADConnectServer = $Script:ServerInventory | Where-Object { 
+        $_.Role -like "*Azure AD Connect*" -or 
+        $_.Role -like "*AAD Connect*" -or 
+        $_.Role -eq "Azure AD Connect"
+    } | Select-Object -First 1
+    
+    if (-not $ADConnectServer) {
+        $AvailableServers = $Script:ServerInventory | ForEach-Object { "$($_.Name) - $($_.Role)" }
+        
+        $Message = "No Azure AD Connect server found in inventory.`n`n"
+        if ($AvailableServers) {
+            $Message += "Available servers:`n" + ($AvailableServers -join "`n")
+        }
+        $Message += "`n`nEnter server name manually?"
+        
+        $Result = [System.Windows.Forms.MessageBox]::Show($Message, "Server Not Found", "YesNo", "Question")
+        
+        if ($Result -eq "Yes") {
+            Add-Type -AssemblyName Microsoft.VisualBasic
+            $ServerName = [Microsoft.VisualBasic.Interaction]::InputBox(
+                "Enter Azure AD Connect server hostname:",
+                "Enter Server Name",
+                "NN-TEST-DC01.nourtest.com"
+            )
+            
+            if ([string]::IsNullOrWhiteSpace($ServerName)) {
+                return
+            }
+            
+            # Register server in connection status
+            if (-not $Script:ConnectionStatus.ContainsKey($ServerName)) {
+                $Script:ConnectionStatus[$ServerName] = @{
+                    Status = 'Connected'
+                    Credential = $Script:Credential
+                    ConnectedAt = Get-Date
+                    Type = 'Azure AD Connect'
+                }
+            }
+        } else {
+            return
+        }
+    } else {
+        $ServerName = $ADConnectServer.Name
+        
+        # Register server in connection status
+        if (-not $Script:ConnectionStatus.ContainsKey($ServerName)) {
+            $Script:ConnectionStatus[$ServerName] = @{
+                Status = 'Connected'
+                Credential = $Script:Credential
+                ConnectedAt = Get-Date
+                Type = 'Azure AD Connect'
+            }
+        }
+    }
+    
+    # Test connectivity
+    Update-Status "Testing connectivity to $ServerName..."
+    if (-not (Test-Connection -ComputerName $ServerName -Count 1 -Quiet -ErrorAction SilentlyContinue)) {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Cannot reach server: $ServerName",
+            "Connection Failed",
+            "OK",
+            "Error"
+        )
+        return
+    }
+    
+    # Permission check
+    Update-Status "Checking Azure AD Connect permissions..."
+    try {
+        $PermCheck = Test-ADConnectPermissions -ServerName $ServerName -Credential $Script:Credential
+        
+        if (-not $PermCheck.HasPermission) {
+            $DetailedMessage = "Permission Check Failed: $ServerName`n`n"
+            $DetailedMessage += "MISSING PERMISSIONS:`n"
+            $DetailedMessage += "============================================`n"
+            foreach ($Missing in $PermCheck.MissingPermissions) {
+                $DetailedMessage += "[X] $Missing`n"
+            }
+            $DetailedMessage += "`nDETAILS:`n============================================`n"
+            foreach ($Detail in $PermCheck.Details) {
+                $DetailedMessage += "  $Detail`n"
+            }
+            
+            [System.Windows.Forms.MessageBox]::Show($DetailedMessage, "Access Denied", "OK", "Error")
+            return
+        }
+        
+        # Show permission dialog
+        $ShouldContinue = Show-PermissionCheckDialog -ValidationType "Azure AD Connect" -PermissionResults $PermCheck
+        if (-not $ShouldContinue) {
+            return
+        }
+    }
+    catch {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Permission check error: $($_.Exception.Message)",
+            "Error",
+            "OK",
+            "Error"
+        )
+        return
+    }
+    
+    # Start validation
+    if (-not (Start-ValidationProgress -ValidationName "Azure AD Connect Validation" -TotalSteps 10)) {
+        return
+    }
+    
+    try {
+        Update-ValidationProgress -CurrentStep 2 -StatusText "Running Azure AD Connect validation..."
+        
+        # Clear existing results and tabs
+        $Script:CurrentResults.Clear()
+        while ($Global:TabControl.TabPages.Count -gt 1) {
+            $Global:TabControl.TabPages.RemoveAt(1)
+        }
+        
+        # Run comprehensive validation
+        $Results = Test-ADConnectComprehensive -ServerName $ServerName -Credential $Script:Credential
+        
+        if (-not $Results -or -not $Results.Version) {
+            Complete-ValidationProgress -CompletionMessage "No data returned"
+            [System.Windows.Forms.MessageBox]::Show(
+                "Failed to retrieve Azure AD Connect data from $ServerName",
+                "Validation Failed",
+                "OK",
+                "Error"
+            )
+            return
+        }
+        
+        Update-ValidationProgress -CurrentStep 8 -StatusText "Building results display..."
+        
+        # Create tab
+        $ADConnectTab = New-Object System.Windows.Forms.TabPage
+        $ADConnectTab.Text = "Azure AD Connect - $ServerName"
+        $ADConnectTab.BackColor = [System.Drawing.Color]::White
+        $ADConnectTab.Padding = New-Object System.Windows.Forms.Padding(10)
+        
+        # Create main scrollable panel
+        $MainPanel = New-Object System.Windows.Forms.Panel
+        $MainPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
+        $MainPanel.AutoScroll = $true
+        $MainPanel.BackColor = [System.Drawing.Color]::White
+        
+        $YPos = 10
+        
+        # === HEADER ===
+        $HeaderPanel = New-Object System.Windows.Forms.Panel
+        $HeaderPanel.Location = New-Object System.Drawing.Point(10, $YPos)
+        $HeaderPanel.Size = New-Object System.Drawing.Size(1400, 70)
+        $HeaderPanel.BackColor = [System.Drawing.Color]::FromArgb(26, 188, 156)
+        
+        $TitleLabel = New-Object System.Windows.Forms.Label
+        $TitleLabel.Text = "  AZURE AD CONNECT VALIDATION - $ServerName"
+        $TitleLabel.Font = New-Object System.Drawing.Font("Segoe UI", 16, [System.Drawing.FontStyle]::Bold)
+        $TitleLabel.ForeColor = [System.Drawing.Color]::White
+        $TitleLabel.Location = New-Object System.Drawing.Point(10, 12)
+        $TitleLabel.AutoSize = $true
+        $HeaderPanel.Controls.Add($TitleLabel)
+        
+        $DateLabel = New-Object System.Windows.Forms.Label
+        $DateLabel.Text = "  Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+        $DateLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+        $DateLabel.ForeColor = [System.Drawing.Color]::White
+        $DateLabel.Location = New-Object System.Drawing.Point(10, 42)
+        $DateLabel.AutoSize = $true
+        $HeaderPanel.Controls.Add($DateLabel)
+        
+        $MainPanel.Controls.Add($HeaderPanel)
+        $YPos += 80
+        
+        # === HELPER FUNCTION TO CREATE SECTIONS ===
+        $CreateSection = {
+            param($Title, $Data, $YPosition)
+            
+            if (-not $Data -or $Data.Count -eq 0) {
+                return $YPosition
+            }
+            
+            # Section header
+            $SectionHeader = New-Object System.Windows.Forms.Panel
+            $SectionHeader.Location = New-Object System.Drawing.Point(10, $YPosition)
+            $SectionHeader.Size = New-Object System.Drawing.Size(1400, 40)
+            $SectionHeader.BackColor = [System.Drawing.Color]::FromArgb(52, 73, 94)
+            
+            $SectionLabel = New-Object System.Windows.Forms.Label
+            $SectionLabel.Text = "  $Title"
+            $SectionLabel.Font = New-Object System.Drawing.Font("Segoe UI", 12, [System.Drawing.FontStyle]::Bold)
+            $SectionLabel.ForeColor = [System.Drawing.Color]::White
+            $SectionLabel.Location = New-Object System.Drawing.Point(10, 8)
+            $SectionLabel.AutoSize = $true
+            $SectionHeader.Controls.Add($SectionLabel)
+            
+            $MainPanel.Controls.Add($SectionHeader)
+            $YPosition += 45
+            
+            # Data grid
+            $DataGrid = New-Object System.Windows.Forms.DataGridView
+            $DataGrid.Location = New-Object System.Drawing.Point(10, $YPosition)
+            $DataGrid.Width = 1400
+            $DataGrid.AutoGenerateColumns = $true
+            $DataGrid.AllowUserToAddRows = $false
+            $DataGrid.AllowUserToDeleteRows = $false
+            $DataGrid.ReadOnly = $true
+            $DataGrid.RowHeadersVisible = $false
+            $DataGrid.SelectionMode = 'FullRowSelect'
+            $DataGrid.BackgroundColor = [System.Drawing.Color]::White
+            $DataGrid.BorderStyle = 'Fixed3D'
+            $DataGrid.AutoSizeColumnsMode = 'Fill'
+            $DataGrid.ColumnHeadersDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(44, 62, 80)
+            $DataGrid.ColumnHeadersDefaultCellStyle.ForeColor = [System.Drawing.Color]::White
+            $DataGrid.ColumnHeadersDefaultCellStyle.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+            $DataGrid.EnableHeadersVisualStyles = $false
+            $DataGrid.AlternatingRowsDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(240, 240, 240)
+            
+            # Calculate height
+            $RowCount = [Math]::Min($Data.Count, 20)
+            $DataGrid.Height = ($RowCount * 32) + 60
+            
+            # Bind data
+            $DataGrid.DataSource = [System.Collections.ArrayList]$Data
+            
+            # Color coding based on Status column
+            $DataGrid.Add_DataBindingComplete({
+                foreach ($Row in $this.Rows) {
+                    $StatusCell = $Row.Cells | Where-Object { $_.OwningColumn.Name -eq "Status" }
+                    if ($StatusCell) {
+                        $StatusValue = $StatusCell.Value
+                        if ($StatusValue -match "Success|OK|Healthy|Running|Enabled|Active") {
+                            $Row.DefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(200, 250, 200)
+                        }
+                        elseif ($StatusValue -match "Warning|Disabled|Idle") {
+                            $Row.DefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(255, 250, 205)
+                        }
+                        elseif ($StatusValue -match "Error|Failed|Critical|Stopped") {
+                            $Row.DefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(255, 200, 200)
+                        }
+                    }
+                    
+                    # Also check Result column
+                    $ResultCell = $Row.Cells | Where-Object { $_.OwningColumn.Name -eq "Result" }
+                    if ($ResultCell) {
+                        $ResultValue = $ResultCell.Value
+                        if ($ResultValue -match "success") {
+                            $Row.DefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(200, 250, 200)
+                        }
+                        elseif ($ResultValue -notmatch "success") {
+                            $Row.DefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(255, 200, 200)
+                        }
+                    }
+                }
+            })
+            
+            $MainPanel.Controls.Add($DataGrid)
+            $YPosition += $DataGrid.Height + 15
+            
+            return $YPosition
+        }
+        
+        # === CREATE ALL SECTIONS ===
+        
+        $YPos = & $CreateSection -Title "HEALTH SUMMARY" -Data $Results.Summary -YPosition $YPos
+        $YPos = & $CreateSection -Title "VERSION INFORMATION" -Data $Results.Version -YPosition $YPos
+        $YPos = & $CreateSection -Title "SERVICE STATUS" -Data $Results.Service -YPosition $YPos
+        $YPos = & $CreateSection -Title "SYNC SCHEDULER CONFIGURATION" -Data $Results.Scheduler -YPosition $YPos
+        $YPos = & $CreateSection -Title "CONNECTORS" -Data $Results.Connectors -YPosition $YPos
+        $YPos = & $CreateSection -Title "RECENT SYNCHRONIZATION HISTORY" -Data $Results.SyncHistory -YPosition $YPos
+        
+        # Sync Errors with special handling
+        if ($Results.SyncErrors -and $Results.SyncErrors.Count -gt 0) {
+            $YPos = & $CreateSection -Title "SYNCHRONIZATION ERRORS" -Data $Results.SyncErrors -YPosition $YPos
+            
+            # Add warning label
+            $WarnLabel = New-Object System.Windows.Forms.Label
+            $WarnLabel.Text = "  [!] WARNING: $($Results.SyncErrors.Count) synchronization error(s) detected!"
+            $WarnLabel.Font = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
+            $WarnLabel.ForeColor = [System.Drawing.Color]::Red
+            $WarnLabel.Location = New-Object System.Drawing.Point(10, $YPos)
+            $WarnLabel.AutoSize = $true
+            $MainPanel.Controls.Add($WarnLabel)
+            $YPos += 30
+        } else {
+            # No errors message
+            $OKPanel = New-Object System.Windows.Forms.Panel
+            $OKPanel.Location = New-Object System.Drawing.Point(10, $YPos)
+            $OKPanel.Size = New-Object System.Drawing.Size(1400, 40)
+            $OKPanel.BackColor = [System.Drawing.Color]::FromArgb(52, 73, 94)
+            
+            $OKLabel = New-Object System.Windows.Forms.Label
+            $OKLabel.Text = "  SYNCHRONIZATION ERRORS"
+            $OKLabel.Font = New-Object System.Drawing.Font("Segoe UI", 12, [System.Drawing.FontStyle]::Bold)
+            $OKLabel.ForeColor = [System.Drawing.Color]::White
+            $OKLabel.Location = New-Object System.Drawing.Point(10, 8)
+            $OKLabel.AutoSize = $true
+            $OKPanel.Controls.Add($OKLabel)
+            $MainPanel.Controls.Add($OKPanel)
+            $YPos += 45
+            
+            $NoErrorLabel = New-Object System.Windows.Forms.Label
+            $NoErrorLabel.Text = "  [OK] No synchronization errors detected"
+            $NoErrorLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+            $NoErrorLabel.ForeColor = [System.Drawing.Color]::Green
+            $NoErrorLabel.Location = New-Object System.Drawing.Point(10, $YPos)
+            $NoErrorLabel.AutoSize = $true
+            $MainPanel.Controls.Add($NoErrorLabel)
+            $YPos += 35
+        }
+        
+        $YPos = & $CreateSection -Title "GLOBAL CONFIGURATION" -Data $Results.GlobalSettings -YPosition $YPos
+        $YPos = & $CreateSection -Title "CONNECTOR METRICS" -Data $Results.Metrics -YPosition $YPos
+        
+        # Add tab to control
+        $ADConnectTab.Controls.Add($MainPanel)
+        $Global:TabControl.TabPages.Add($ADConnectTab)
+        $Global:TabControl.SelectedTab = $ADConnectTab
+        
+        # Store results
+        $Script:CurrentResults[$ServerName] = @{ Results = $Results }
+        
+        Write-AuditLog -Action "AADConnectValidation" -Target $ServerName -Result "Success" -Details "Validation completed"
+        
+        Complete-ValidationProgress -CompletionMessage "Azure AD Connect validation completed for $ServerName"
+    }
+    catch {
+        Complete-ValidationProgress -CompletionMessage "Validation error"
+        
+        [System.Windows.Forms.MessageBox]::Show(
+            "Error during validation: $($_.Exception.Message)",
+            "Validation Error",
+            "OK",
+            "Error"
+        )
+        
+        Write-AuditLog -Action "AADConnectValidation" -Target $ServerName -Result "Error" -Details $_.Exception.Message
+    }
+}
+
+
 #region Export Functions
 
 function Export-ValidationReport {
@@ -4992,6 +6237,9 @@ function Show-ValidationGUI {
     # NEW ADFS VALIDATION BUTTON
     $ADFSButton = New-StyledButton -Text "ADFS Validation" -BackColor ([System.Drawing.Color]::FromArgb(230, 126, 34)) -ClickAction { Show-ADFSResults }
     $ButtonPanel.Controls.Add($ADFSButton)
+    # NEW AZURE AD CONNECT VALIDATION BUTTON
+    $ADConnectButton = New-StyledButton -Text "Azure AD Connect" -BackColor ([System.Drawing.Color]::FromArgb(26, 188, 156)) -ClickAction { Show-ADConnectResults }
+    $ButtonPanel.Controls.Add($ADConnectButton)
     $ExportButton = New-StyledButton -Text "Export Report" -BackColor ([System.Drawing.Color]::FromArgb(44, 62, 80)) -ClickAction { Export-ValidationReport }
     $ButtonPanel.Controls.Add($ExportButton)
     # Professional Status Bar Panel
@@ -5226,7 +6474,7 @@ function Show-ValidationGUI {
     $Step2Panel.Controls.Add($Step2Number)
     
     $Step2Text = New-Object System.Windows.Forms.Label
-    $Step2Text.Text = "SELECT VALIDATION - Choose: System Utilization, Exchange, AD, or ADFS"
+    $Step2Text.Text = "SELECT VALIDATION - Choose: System Utilization, Exchange, AD, ADFS, or Azure AD Connect"
     $Step2Text.Font = New-Object System.Drawing.Font("Segoe UI", 10)
     $Step2Text.ForeColor = [System.Drawing.Color]::FromArgb(44, 62, 80)
     $Step2Text.Location = New-Object System.Drawing.Point(45, 9)
