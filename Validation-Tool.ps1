@@ -4291,71 +4291,568 @@ function Sanitize-HTMLContent {
     
     return $Content
 }
+
 function Generate-HTMLReport {
     param([hashtable]$Results)
+    
     $HTML = @"
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Exchange Infrastructure Validation Report</title>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Infrastructure Validation Report</title>
     <style>
-        body { font-family: 'Segoe UI', Arial, sans-serif; margin: 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
-        .container { max-width: 1600px; margin: 0 auto; background: white; padding: 40px; border-radius: 12px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); }
-        h1 { color: #2c3e50; border-bottom: 4px solid #3498db; padding-bottom: 15px; font-size: 2.5em; margin-bottom: 30px; }
-        h2 { color: #34495e; margin-top: 40px; background: linear-gradient(135deg, #f8f9fa, #e9ecef); padding: 15px; border-left: 5px solid #3498db; border-radius: 5px; }
-        table { width: 100%; border-collapse: collapse; margin: 20px 0; box-shadow: 0 4px 8px rgba(0,0,0,0.1); border-radius: 8px; overflow: hidden; }
-        th { background: linear-gradient(135deg, #2c3e50, #34495e); color: white; padding: 14px; text-align: left; font-weight: 600; text-transform: uppercase; font-size: 0.9em; }
-        td { padding: 12px; border-bottom: 1px solid #ecf0f1; }
-        tr:hover { background: #f8f9fa; }
-        tr:last-child td { border-bottom: none; }
-        .success { background: #d4edda; color: #155724; font-weight: 600; }
-        .warning { background: #fff3cd; color: #856404; font-weight: 600; }
-        .error { background: #f8d7da; color: #721c24; font-weight: 600; }
-        .section { margin: 30px 0; padding: 25px; background: #f8f9fa; border-radius: 8px; border-left: 5px solid #3498db; }
-        .timestamp { color: #7f8c8d; font-size: 0.95em; margin-bottom: 20px; }
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: #F5F7FA;
+            color: #2C3E50;
+            line-height: 1.6;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1600px;
+            margin: 0 auto;
+            background: #FFFFFF;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+            overflow: hidden;
+        }
+        
+        /* HEADER SECTION */
+        .header {
+            background: linear-gradient(135deg, #1877F2 0%, #0A66C2 100%);
+            color: #FFFFFF;
+            padding: 40px 50px;
+        }
+        
+        .header h1 {
+            font-size: 32px;
+            font-weight: 600;
+            margin-bottom: 8px;
+            letter-spacing: -0.5px;
+        }
+        
+        .header .subtitle {
+            font-size: 16px;
+            font-weight: 400;
+            opacity: 0.9;
+            margin-bottom: 25px;
+        }
+        
+        .header .meta-info {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-top: 20px;
+            padding-top: 20px;
+            border-top: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        
+        .meta-item {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        
+        .meta-item .label {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            opacity: 0.8;
+            font-weight: 500;
+        }
+        
+        .meta-item .value {
+            font-size: 15px;
+            font-weight: 600;
+        }
+        
+        /* TABLE OF CONTENTS */
+        .toc {
+            background: #F8F9FA;
+            padding: 30px 50px;
+            border-bottom: 1px solid #E1E4E8;
+        }
+        
+        .toc h2 {
+            color: #1877F2;
+            font-size: 20px;
+            margin-bottom: 20px;
+            font-weight: 600;
+        }
+        
+        .toc-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 12px;
+        }
+        
+        .toc-item {
+            background: #FFFFFF;
+            padding: 12px 16px;
+            border-radius: 6px;
+            border-left: 3px solid #1877F2;
+            text-decoration: none;
+            color: #2C3E50;
+            display: block;
+            transition: all 0.2s ease;
+            font-weight: 500;
+            font-size: 14px;
+        }
+        
+        .toc-item:hover {
+            background: #E7F3FF;
+            transform: translateX(3px);
+        }
+        
+        /* CONTENT SECTION */
+        .content {
+            padding: 40px 50px;
+        }
+        
+        .server-section {
+            margin-bottom: 50px;
+        }
+        
+        .server-header {
+            background: #1877F2;
+            color: #FFFFFF;
+            padding: 20px 30px;
+            border-radius: 6px 6px 0 0;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 0;
+        }
+        
+        .server-header h2 {
+            font-size: 22px;
+            font-weight: 600;
+        }
+        
+        .server-status {
+            background: rgba(255, 255, 255, 0.2);
+            padding: 6px 14px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
+        /* CATEGORY SECTIONS */
+        .category-section {
+            margin-bottom: 30px;
+            background: #FFFFFF;
+            border: 1px solid #E1E4E8;
+            border-radius: 6px;
+            overflow: hidden;
+        }
+        
+        .category-header {
+            background: #F8F9FA;
+            padding: 16px 30px;
+            border-bottom: 2px solid #1877F2;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        
+        .category-header h3 {
+            color: #1877F2;
+            font-size: 18px;
+            font-weight: 600;
+        }
+        
+        .item-count {
+            background: #1877F2;
+            color: #FFFFFF;
+            padding: 4px 12px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        
+        /* TABLES */
+        .table-container {
+            overflow-x: auto;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }
+        
+        thead {
+            background: #2C3E50;
+            color: #FFFFFF;
+        }
+        
+        th {
+            padding: 14px 16px;
+            text-align: left;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            font-size: 11px;
+        }
+        
+        td {
+            padding: 12px 16px;
+            border-bottom: 1px solid #E1E4E8;
+            color: #2C3E50;
+        }
+        
+        tbody tr {
+            transition: background-color 0.15s ease;
+        }
+        
+        tbody tr:hover {
+            background-color: #F8F9FA;
+        }
+        
+        tbody tr:nth-child(even) {
+            background-color: #FAFBFC;
+        }
+        
+        /* STATUS COLORS */
+        .status-success {
+            background-color: #D4EDDA !important;
+        }
+        
+        .status-warning {
+            background-color: #FFF3CD !important;
+        }
+        
+        .status-error {
+            background-color: #F8D7DA !important;
+        }
+        
+        .status-info {
+            background-color: #D1ECF1 !important;
+        }
+        
+        /* STATUS BADGES */
+        .badge {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+        }
+        
+        .badge-success {
+            background: #28A745;
+            color: #FFFFFF;
+        }
+        
+        .badge-warning {
+            background: #FFC107;
+            color: #212529;
+        }
+        
+        .badge-error {
+            background: #DC3545;
+            color: #FFFFFF;
+        }
+        
+        .badge-info {
+            background: #17A2B8;
+            color: #FFFFFF;
+        }
+        
+        /* FOOTER */
+        .footer {
+            background: #F8F9FA;
+            padding: 30px 50px;
+            text-align: center;
+            border-top: 1px solid #E1E4E8;
+        }
+        
+        .footer-content {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        
+        .footer h3 {
+            color: #1877F2;
+            font-size: 18px;
+            margin-bottom: 12px;
+            font-weight: 600;
+        }
+        
+        .footer p {
+            color: #6C757D;
+            font-size: 13px;
+            line-height: 1.7;
+        }
+        
+        .footer-logo {
+            margin-top: 20px;
+            padding-top: 20px;
+            border-top: 1px solid #E1E4E8;
+            color: #6C757D;
+            font-size: 12px;
+        }
+        
+        /* RESPONSIVE */
+        @media (max-width: 1200px) {
+            .container {
+                max-width: 95%;
+            }
+        }
+        
+        @media (max-width: 768px) {
+            .header {
+                padding: 30px;
+            }
+            
+            .header h1 {
+                font-size: 24px;
+            }
+            
+            .content, .toc, .footer {
+                padding: 25px 30px;
+            }
+            
+            .toc-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .server-header h2 {
+                font-size: 18px;
+            }
+            
+            table {
+                font-size: 12px;
+            }
+            
+            th, td {
+                padding: 10px 12px;
+            }
+        }
+        
+        /* PRINT STYLES */
+        @media print {
+            body {
+                background: #FFFFFF;
+                padding: 0;
+            }
+            
+            .container {
+                box-shadow: none;
+            }
+            
+            .toc {
+                display: none;
+            }
+            
+            .server-section {
+                page-break-inside: avoid;
+            }
+        }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>Infrastructure Handover Report</h1>
-        <p class="timestamp"><strong>Generated:</strong> $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p>
+        <!-- HEADER -->
+        <div class="header">
+            <div class="header-content">
+                <h1>Infrastructure Validation Report</h1>
+                <div class="subtitle">Comprehensive System Health Assessment &amp; Documentation</div>
+                
+                <div class="meta-info">
+                    <div class="meta-item">
+                        <div class="label">Generated Date</div>
+                        <div class="value">$(Get-Date -Format 'MMMM dd, yyyy')</div>
+                    </div>
+                    <div class="meta-item">
+                        <div class="label">Generated Time</div>
+                        <div class="value">$(Get-Date -Format 'HH:mm:ss')</div>
+                    </div>
+                    <div class="meta-item">
+                        <div class="label">Total Servers</div>
+                        <div class="value">$($Results.Keys.Count)</div>
+                    </div>
+                    <div class="meta-item">
+                        <div class="label">Created By</div>
+                        <div class="value">Hisham Nasur - NN - MS Operation</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- TABLE OF CONTENTS -->
+        <div class="toc">
+            <h2>Table of Contents</h2>
+            <div class="toc-grid">
 "@
+
+    # Generate TOC
+    foreach ($ServerName in $Results.Keys | Sort-Object) {
+        $SafeServerName = $ServerName -replace '[^a-zA-Z0-9]', '-'
+        $HTML += "                <a href=`"#server-$SafeServerName`" class=`"toc-item`">$ServerName</a>`r`n"
+    }
+
+    $HTML += @"
+            </div>
+        </div>
+        
+        <!-- MAIN CONTENT -->
+        <div class="content">
+"@
+
+    # Generate Server Sections
     foreach ($ServerName in $Results.Keys | Sort-Object) {
         $ServerData = $Results[$ServerName]
         $Data = $ServerData.Results
-        $HTML += "<h2>Server: $ServerName</h2>"
+        $ServerID = $ServerName -replace '[^a-zA-Z0-9]', '-'
+        
+        $HTML += @"
+            <div class="server-section" id="server-$ServerID">
+                <div class="server-header">
+                    <h2>$ServerName</h2>
+                    <span class="server-status">Active</span>
+                </div>
+"@
+
+        # Generate Categories
         foreach ($Category in $Data.Keys | Sort-Object) {
             if ($Data[$Category].Count -gt 0) {
-                $HTML += "<div class='section'><h3>$Category</h3><table><tr>"
+                $ItemCount = $Data[$Category].Count
+                
+                $HTML += @"
+                <div class="category-section">
+                    <div class="category-header">
+                        <h3>$Category</h3>
+                        <span class="item-count">$ItemCount Items</span>
+                    </div>
+                    <div class="table-container">
+                        <table>
+                            <thead>
+                                <tr>
+"@
+
+                # Generate Table Headers
                 $FirstItem = $Data[$Category][0]
                 $Properties = $FirstItem.PSObject.Properties.Name
+                
                 foreach ($Prop in $Properties) {
-                    $HTML += "<th>$Prop</th>"
+                    $HTML += "                                    <th>$Prop</th>`r`n"
                 }
-                $HTML += "</tr>"
+                
+                $HTML += @"
+                                </tr>
+                            </thead>
+                            <tbody>
+"@
+
+                # Generate Table Rows
                 foreach ($Item in $Data[$Category]) {
+                    # Determine row class based on Status
                     $RowClass = ""
-                    if ($Item.Status -eq "OK" -or $Item.Status -eq "Normal" -or $Item.Status -eq "Valid") {
-                        $RowClass = "success"
+                    $StatusValue = ""
+                    
+                    # Try to find status column
+                    if ($Item.PSObject.Properties.Name -contains "Status") {
+                        $StatusValue = $Item.Status
                     }
-                    elseif ($Item.Status -match "Warning|Check|Expiring|Info") {
-                        $RowClass = "warning"
+                    elseif ($Item.PSObject.Properties.Name -contains "Result") {
+                        $StatusValue = $Item.Result
                     }
-                    elseif ($Item.Status -match "Error|Failed|EXPIRED|SECURITY|Critical") {
-                        $RowClass = "error"
+                    elseif ($Item.PSObject.Properties.Name -contains "StatusCode") {
+                        $StatusValue = $Item.StatusCode
                     }
-                    $HTML += "<tr class='$RowClass'>"
+                    
+                    # Assign class based on status
+                    if ($StatusValue -match "OK|Normal|Valid|Running|Success|Enabled|Active|Configured|Listening") {
+                        $RowClass = " class='status-success'"
+                    }
+                    elseif ($StatusValue -match "Warning|Check|Expiring|Not Configured") {
+                        $RowClass = " class='status-warning'"
+                    }
+                    elseif ($StatusValue -match "Error|Failed|Critical|EXPIRED|SECURITY|RISK|Not Running|Missing") {
+                        $RowClass = " class='status-error'"
+                    }
+                    elseif ($StatusValue -match "Info") {
+                        $RowClass = " class='status-info'"
+                    }
+                    
+                    $HTML += "                                <tr$RowClass>`r`n"
+                    
                     foreach ($Prop in $Properties) {
-                        $HTML += "<td>$(Sanitize-HTMLContent -Content $Item.$Prop)</td>"
+                        $CellValue = Sanitize-HTMLContent -Content $Item.$Prop
+                        
+                        # Add badge to status columns
+                        if ($Prop -match "Status|Result|StatusCode" -and $CellValue) {
+                            $BadgeClass = "badge-info"
+                            if ($CellValue -match "OK|Normal|Valid|Running|Success|Enabled|Active|Configured|Listening") {
+                                $BadgeClass = "badge-success"
+                            }
+                            elseif ($CellValue -match "Warning|Check|Expiring") {
+                                $BadgeClass = "badge-warning"
+                            }
+                            elseif ($CellValue -match "Error|Failed|Critical|EXPIRED|SECURITY|RISK") {
+                                $BadgeClass = "badge-error"
+                            }
+                            
+                            $HTML += "                                    <td><span class='badge $BadgeClass'>$CellValue</span></td>`r`n"
+                        }
+                        else {
+                            $HTML += "                                    <td>$CellValue</td>`r`n"
+                        }
                     }
-                    $HTML += "</tr>"
+                    
+                    $HTML += "                                </tr>`r`n"
                 }
-                $HTML += "</table></div>"
+                
+                $HTML += @"
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+"@
             }
         }
+        
+        $HTML += @"
+            </div>
+"@
     }
-    $HTML += "</div></body></html>"
+
+    $HTML += @"
+        </div>
+        
+        <!-- FOOTER -->
+        <div class="footer">
+            <div class="footer-content">
+                <h3>Infrastructure Validation Tool</h3>
+                <p>
+                    This report was automatically generated by the Infrastructure Validation Tool v1.0<br>
+                    Professional infrastructure health assessment and documentation system
+                </p>
+                <div class="footer-logo">
+                    <strong>$(Get-Date -Format 'yyyy') Hisham Nasur - NN - MS Operation</strong><br>
+                    Infrastructure Handover Validation Tool | Version 1.0
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+"@
+
     return $HTML
 }
 
