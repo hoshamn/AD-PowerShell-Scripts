@@ -4862,9 +4862,7 @@ function Show-ADResults {
         Write-AuditLog -Action "ADValidation" -Target "Cancelled" -Result "UserChoice"
         return
     }
-    
-    # Get Domain Controllers from inventory
-    
+       
     # Get Domain Controllers from inventory
     $DCs = $Script:ServerInventory | Where-Object { $_.Role -match "DC|Domain Controller|AD" }
     
@@ -5158,13 +5156,14 @@ function Show-ADFSResults {
 function Show-ADConnectResults {
     if (-not $Script:Credential) {
         [System.Windows.Forms.MessageBox]::Show(
-            "Please connect with credentials first.",
+            "You must connect with credentials first!`n`nClick the 'Connect' button to authenticate before running validations.",
             "Authentication Required",
             "OK",
             "Warning"
         )
         return
     }
+    
     
     # Find Azure AD Connect server in inventory
     $ADConnectServer = $Script:ServerInventory | Where-Object { 
@@ -6686,13 +6685,48 @@ function Show-ValidationGUI {
         [System.GC]::Collect()
         [System.GC]::WaitForPendingFinalizers()
     })
-    $Global:MainForm.Text = "Infrastructure Validation Tool v1.0"
+    $Global:MainForm = New-Object System.Windows.Forms.Form
+    $Global:MainForm.Text = "Infrastructure Validation Tool"
     $Global:MainForm.Size = New-Object System.Drawing.Size(1500, 900)
     $Global:MainForm.StartPosition = "CenterScreen"
     $Global:MainForm.BackColor = [System.Drawing.Color]::FromArgb(240, 240, 240)
-    $Global:MainForm.MinimumSize = New-Object System.Drawing.Size(1200, 700)
+    $Global:MainForm.MinimumSize = New-Object System.Drawing.Size(1200, 700)  # ← ADD THIS LINE
     $Global:MainForm.MaximizeBox = $true
     $Global:MainForm.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::Sizable
+
+    # Add resize handler
+    $Global:MainForm.Add_Resize({
+        # Get current form size
+        $FormWidth = $Global:MainForm.ClientSize.Width
+        $FormHeight = $Global:MainForm.ClientSize.Height
+        
+        # Adjust Button Panel
+        if ($ButtonPanel) {
+            $ButtonPanel.Width = $FormWidth - 40
+        }
+        
+        # Adjust Status Bar Panel
+        if ($StatusBarPanel) {
+            $StatusBarPanel.Width = $FormWidth - 40
+        }
+        
+        # Adjust Progress Container
+        if ($Global:ProgressContainer) {
+            $Global:ProgressContainer.Width = $FormWidth - 40
+        }
+        
+        # Adjust Tab Control
+        if ($Global:TabControl) {
+            $TabHeight = $FormHeight - 290
+            $Global:TabControl.Size = New-Object System.Drawing.Size(($FormWidth - 40), $TabHeight)
+        }
+        
+        # Force button panel to recalculate button sizes
+        if ($ButtonPanel) {
+            $ButtonPanel.PerformLayout()
+        }
+    })
+
     $TitleLabel = New-Object System.Windows.Forms.Label
     $TitleLabel.Text = "Infrastructure Handover Validation Tool"
     $TitleLabel.Font = New-Object System.Drawing.Font("Segoe UI", 18, [System.Drawing.FontStyle]::Bold)
@@ -6707,12 +6741,12 @@ function Show-ValidationGUI {
     $SubtitleLabel.AutoSize = $true
     $SubtitleLabel.Location = New-Object System.Drawing.Point(20, 60)
     $Global:MainForm.Controls.Add($SubtitleLabel)
-    $ButtonPanel = New-Object System.Windows.Forms.FlowLayoutPanel
-    $ButtonPanel.Size = New-Object System.Drawing.Size(1460, 70)
+    # Button Panel - Responsive design
+    $ButtonPanel = New-Object System.Windows.Forms.Panel
     $ButtonPanel.Location = New-Object System.Drawing.Point(20, 90)
+    $ButtonPanel.Size = New-Object System.Drawing.Size(($Global:MainForm.ClientSize.Width - 40), 70)
     $ButtonPanel.BackColor = [System.Drawing.Color]::White
     $ButtonPanel.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
-    $ButtonPanel.Padding = New-Object System.Windows.Forms.Padding(10)
     $ButtonPanel.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
     $Global:MainForm.Controls.Add($ButtonPanel)
 
@@ -6720,19 +6754,28 @@ function Show-ValidationGUI {
         param([string]$Text, [System.Drawing.Color]$BackColor, [scriptblock]$ClickAction)
         $Button = New-Object System.Windows.Forms.Button
         $Button.Text = $Text
-        $Button.Size = New-Object System.Drawing.Size(220, 45)
         $Button.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
         $Button.BackColor = $BackColor
         $Button.ForeColor = [System.Drawing.Color]::White
         $Button.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
         $Button.FlatAppearance.BorderSize = 0
         $Button.Cursor = [System.Windows.Forms.Cursors]::Hand
-        $Button.Margin = New-Object System.Windows.Forms.Padding(5)
         $Button.Add_Click($ClickAction)
         return $Button
     }
-    
-    # Create Connect/Disconnect button FIRST
+
+    # Calculate button dimensions
+    $ButtonCount = 7
+    $ButtonSpacing = 5
+    $TotalSpacing = $ButtonSpacing * ($ButtonCount + 1)
+    $AvailableWidth = $ButtonPanel.Width - $TotalSpacing
+    $ButtonWidth = [math]::Floor($AvailableWidth / $ButtonCount)
+    $ButtonHeight = 50
+
+    # Create buttons with calculated width
+    $XPos = $ButtonSpacing
+
+    # Connect/Disconnect button
     $Global:ConnectButton = New-StyledButton -Text "Connect" -BackColor ([System.Drawing.Color]::FromArgb(39, 174, 96)) -ClickAction {
         if ($Script:Credential) {
             Disconnect-Credentials
@@ -6741,22 +6784,71 @@ function Show-ValidationGUI {
             Connect-WithCredentials
         }
     }
+    $Global:ConnectButton.Location = New-Object System.Drawing.Point($XPos, 10)
+    $Global:ConnectButton.Size = New-Object System.Drawing.Size($ButtonWidth, $ButtonHeight)
     $ButtonPanel.Controls.Add($Global:ConnectButton)
+    $XPos += $ButtonWidth + $ButtonSpacing
+
+    # System Utilization button
     $UtilButton = New-StyledButton -Text "System Utilization" -BackColor ([System.Drawing.Color]::FromArgb(52, 152, 219)) -ClickAction { Show-UtilizationResults }
+    $UtilButton.Location = New-Object System.Drawing.Point($XPos, 10)
+    $UtilButton.Size = New-Object System.Drawing.Size($ButtonWidth, $ButtonHeight)
     $ButtonPanel.Controls.Add($UtilButton)
+    $XPos += $ButtonWidth + $ButtonSpacing
+
+    # Exchange button
     $ExchangeButton = New-StyledButton -Text "Exchange Validation" -BackColor ([System.Drawing.Color]::FromArgb(155, 89, 182)) -ClickAction { Show-ExchangeResults }
+    $ExchangeButton.Location = New-Object System.Drawing.Point($XPos, 10)
+    $ExchangeButton.Size = New-Object System.Drawing.Size($ButtonWidth, $ButtonHeight)
     $ButtonPanel.Controls.Add($ExchangeButton)
-    # NEW AD VALIDATION BUTTON
+    $XPos += $ButtonWidth + $ButtonSpacing
+
+    # AD button
     $ADButton = New-StyledButton -Text "AD Validation" -BackColor ([System.Drawing.Color]::FromArgb(46, 204, 113)) -ClickAction { Show-ADResults }
+    $ADButton.Location = New-Object System.Drawing.Point($XPos, 10)
+    $ADButton.Size = New-Object System.Drawing.Size($ButtonWidth, $ButtonHeight)
     $ButtonPanel.Controls.Add($ADButton)
-    # NEW ADFS VALIDATION BUTTON
+    $XPos += $ButtonWidth + $ButtonSpacing
+
+    # ADFS button
     $ADFSButton = New-StyledButton -Text "ADFS Validation" -BackColor ([System.Drawing.Color]::FromArgb(230, 126, 34)) -ClickAction { Show-ADFSResults }
+    $ADFSButton.Location = New-Object System.Drawing.Point($XPos, 10)
+    $ADFSButton.Size = New-Object System.Drawing.Size($ButtonWidth, $ButtonHeight)
     $ButtonPanel.Controls.Add($ADFSButton)
-    # NEW AZURE AD CONNECT VALIDATION BUTTON
+    $XPos += $ButtonWidth + $ButtonSpacing
+
+    # Azure AD Connect button
     $ADConnectButton = New-StyledButton -Text "Azure AD Connect" -BackColor ([System.Drawing.Color]::FromArgb(26, 188, 156)) -ClickAction { Show-ADConnectResults }
+    $ADConnectButton.Location = New-Object System.Drawing.Point($XPos, 10)
+    $ADConnectButton.Size = New-Object System.Drawing.Size($ButtonWidth, $ButtonHeight)
     $ButtonPanel.Controls.Add($ADConnectButton)
+    $XPos += $ButtonWidth + $ButtonSpacing
+
+    # Export button
     $ExportButton = New-StyledButton -Text "Export Report" -BackColor ([System.Drawing.Color]::FromArgb(44, 62, 80)) -ClickAction { Show-ExportDialog }
+    $ExportButton.Location = New-Object System.Drawing.Point($XPos, 10)
+    $ExportButton.Size = New-Object System.Drawing.Size($ButtonWidth, $ButtonHeight)
     $ButtonPanel.Controls.Add($ExportButton)
+
+    # Add resize handler for button panel to recalculate button widths
+    $ButtonPanel.Add_Resize({
+        $PanelWidth = $this.Width
+        $ButtonCount = 7
+        $ButtonSpacing = 5
+        $TotalSpacing = $ButtonSpacing * ($ButtonCount + 1)
+        $AvailableWidth = $PanelWidth - $TotalSpacing
+        $NewButtonWidth = [math]::Floor($AvailableWidth / $ButtonCount)
+        
+        # Resize and reposition all buttons
+        $XPos = $ButtonSpacing
+        foreach ($Control in $this.Controls) {
+            if ($Control -is [System.Windows.Forms.Button]) {
+                $Control.Width = $NewButtonWidth
+                $Control.Location = New-Object System.Drawing.Point($XPos, 10)
+                $XPos += $NewButtonWidth + $ButtonSpacing
+            }
+        }
+    })
     # Professional Status Bar Panel
     $StatusBarPanel = New-Object System.Windows.Forms.Panel
     $StatusBarPanel.Location = New-Object System.Drawing.Point(20, 170)
