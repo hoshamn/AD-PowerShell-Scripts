@@ -71,219 +71,6 @@ $Script:Colors = @{
 
 #region Helper Functions
 
-function Test-ComprehensivePermissions {
-    param(
-        [System.Management.Automation.PSCredential]$Credential
-    )
-    
-    $Results = @{
-        IsDomainAdmin = $false
-        IsEnterpriseAdmin = $false
-        IsOrgManagement = $false
-        IsLocalAdmin = @{}  # Will store server-name: true/false
-        CanValidateSystemUtil = $false
-        CanValidateAD = $false
-        CanValidateExchange = $false
-        CanValidateADFS = $false
-        CanValidateAADConnect = $false
-        Details = @()
-        Summary = ""
-    }
-    
-    try {
-        # Step 1: Check Domain Admin and Enterprise Admin membership
-        $DC = $Script:ServerInventory | Where-Object { $_.Role -match "DC|Domain Controller|AD" } | Select-Object -First 1
-        
-        if ($DC) {
-            $ServerName = $DC.Name
-            
-            if (Test-ServerConnection -ServerName $ServerName -Credential $Credential) {
-                $ScriptBlock = {
-                    $UserInfo = @{
-                        IsDomainAdmin = $false
-                        IsEnterpriseAdmin = $false
-                        Username = $env:USERNAME
-                        Domain = $env:USERDOMAIN
-                    }
-                    
-                    try {
-                        Import-Module ActiveDirectory -ErrorAction Stop
-                        
-                        # Get the user's actual identity
-                        $CurrentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-                        
-                        # Check for Domain Admins (SID ends with -512)
-                        $DomainAdminSID = $CurrentUser.Groups | Where-Object { $_.Value -match "S-1-5-21-.*-512$" }
-                        if ($DomainAdminSID) {
-                            $UserInfo.IsDomainAdmin = $true
-                        }
-                        
-                        # Check for Enterprise Admins (SID ends with -519)
-                        $EnterpriseAdminSID = $CurrentUser.Groups | Where-Object { $_.Value -match "S-1-5-21-.*-519$" }
-                        if ($EnterpriseAdminSID) {
-                            $UserInfo.IsEnterpriseAdmin = $true
-                        }
-                        
-                        # Alternative method using group membership
-                        $Username = $CurrentUser.Name.Split('\')[-1]
-                        
-                        $DomainAdmins = Get-ADGroupMember -Identity "Domain Admins" -ErrorAction SilentlyContinue
-                        if ($DomainAdmins.SamAccountName -contains $Username) {
-                            $UserInfo.IsDomainAdmin = $true
-                        }
-                        
-                        $EnterpriseAdmins = Get-ADGroupMember -Identity "Enterprise Admins" -ErrorAction SilentlyContinue
-                        if ($EnterpriseAdmins.SamAccountName -contains $Username) {
-                            $UserInfo.IsEnterpriseAdmin = $true
-                        }
-                    }
-                    catch {
-                        $UserInfo.Error = $_.Exception.Message
-                    }
-                    
-                    return $UserInfo
-                }
-                
-                $ADCheck = Invoke-SafeRemoteCommand -ServerName $ServerName -ScriptBlock $ScriptBlock -Credential $Credential
-                
-                if ($ADCheck.Success -and $ADCheck.Data) {
-                    $Results.IsDomainAdmin = $ADCheck.Data.IsDomainAdmin
-                    $Results.IsEnterpriseAdmin = $ADCheck.Data.IsEnterpriseAdmin
-                    
-                    if ($Results.IsDomainAdmin) {
-                        $Results.Details += "[OK] User is a member of Domain Admins"
-                    }
-                    else {
-                        $Results.Details += "[X] User is NOT a member of Domain Admins"
-                    }
-                    
-                    if ($Results.IsEnterpriseAdmin) {
-                        $Results.Details += "[OK] User is a member of Enterprise Admins"
-                    }
-                    else {
-                        $Results.Details += "[INFO] User is NOT a member of Enterprise Admins"
-                    }
-                }
-            }
-        }
-        
-        # Step 2: Check Exchange Organization Management
-        $ExchServer = $Script:ServerInventory | Where-Object { $_.Role -match "Exchange" } | Select-Object -First 1
-        
-        if ($ExchServer) {
-            $ServerName = $ExchServer.Name
-            
-            if (Test-ServerConnection -ServerName $ServerName -Credential $Credential) {
-                try {
-                    $Session = Connect-ExchangeRemote -ServerName $ServerName -Credential $Credential
-                    
-                    if ($Session) {
-                        # Get current username
-                        $CurrentUserName = $Credential.UserName
-                        if ($CurrentUserName -match '@') {
-                            $CurrentUserName = $CurrentUserName.Split('@')[0]
-                        }
-                        elseif ($CurrentUserName -match '\\') {
-                            $CurrentUserName = $CurrentUserName.Split('\')[-1]
-                        }
-                        
-                        # Check Organization Management membership
-                        $OrgMgmtMembers = Get-RoleGroupMember -Identity "Organization Management" -ErrorAction SilentlyContinue
-                        
-                        foreach ($Member in $OrgMgmtMembers) {
-                            if ($Member.SamAccountName -eq $CurrentUserName -or 
-                                $Member.Name -eq $CurrentUserName -or
-                                $Member.Alias -eq $CurrentUserName) {
-                                $Results.IsOrgManagement = $true
-                                break
-                            }
-                        }
-                        
-                        if ($Results.IsOrgManagement) {
-                            $Results.Details += "[OK] User is a member of Exchange Organization Management"
-                        }
-                        else {
-                            $Results.Details += "[X] User is NOT a member of Exchange Organization Management"
-                        }
-                        
-                        Disconnect-ExchangeRemote -ServerName $ServerName
-                    }
-                }
-                catch {
-                    $Results.Details += "[WARNING] Could not check Exchange permissions: $($_.Exception.Message)"
-                }
-            }
-        }
-        
-        # Step 3: Determine what can be validated
-        # System Utilization - requires Domain Admin OR Enterprise Admin
-        if ($Results.IsDomainAdmin -or $Results.IsEnterpriseAdmin) {
-            $Results.CanValidateSystemUtil = $true
-            $Results.Details += "[OK] CAN validate System Utilization (Domain/Enterprise Admin)"
-        }
-        else {
-            $Results.Details += "[X] CANNOT validate System Utilization (Requires Domain/Enterprise Admin)"
-        }
-        
-        # AD Validation - requires Domain Admin OR Enterprise Admin
-        if ($Results.IsDomainAdmin -or $Results.IsEnterpriseAdmin) {
-            $Results.CanValidateAD = $true
-            $Results.Details += "[OK] CAN validate Active Directory (Domain/Enterprise Admin)"
-        }
-        else {
-            $Results.Details += "[X] CANNOT validate Active Directory (Requires Domain/Enterprise Admin)"
-        }
-        
-        # Exchange Validation - requires BOTH Domain Admin AND Organization Management
-        if ($Results.IsDomainAdmin -and $Results.IsOrgManagement) {
-            $Results.CanValidateExchange = $true
-            $Results.Details += "[OK] CAN validate Exchange (Domain Admin + Org Management)"
-        }
-        else {
-            if (-not $Results.IsDomainAdmin) {
-                $Results.Details += "[X] CANNOT validate Exchange (Missing Domain Admin)"
-            }
-            if (-not $Results.IsOrgManagement) {
-                $Results.Details += "[X] CANNOT validate Exchange (Missing Organization Management)"
-            }
-        }
-        
-        # ADFS Validation - requires Domain Admin OR Enterprise Admin
-        if ($Results.IsDomainAdmin -or $Results.IsEnterpriseAdmin) {
-            $Results.CanValidateADFS = $true
-            $Results.Details += "[OK] CAN validate ADFS (Domain/Enterprise Admin)"
-        }
-        else {
-            $Results.Details += "[X] CANNOT validate ADFS (Requires Domain/Enterprise Admin)"
-        }
-        
-        # Azure AD Connect - requires Domain Admin OR Enterprise Admin
-        if ($Results.IsDomainAdmin -or $Results.IsEnterpriseAdmin) {
-            $Results.CanValidateAADConnect = $true
-            $Results.Details += "[OK] CAN validate Azure AD Connect (Domain/Enterprise Admin)"
-        }
-        else {
-            $Results.Details += "[X] CANNOT validate Azure AD Connect (Requires Domain/Enterprise Admin)"
-        }
-        
-        # Create summary
-        $CanValidateCount = 0
-        if ($Results.CanValidateSystemUtil) { $CanValidateCount++ }
-        if ($Results.CanValidateAD) { $CanValidateCount++ }
-        if ($Results.CanValidateExchange) { $CanValidateCount++ }
-        if ($Results.CanValidateADFS) { $CanValidateCount++ }
-        if ($Results.CanValidateAADConnect) { $CanValidateCount++ }
-        
-        $Results.Summary = "Can validate $CanValidateCount of 5 components"
-        
-    }
-    catch {
-        $Results.Details += "[ERROR] Failed to check permissions: $($_.Exception.Message)"
-    }
-    
-    return $Results
-}
-
 function Test-ServerNameSafety {
     param([string]$ServerName)
     
@@ -346,185 +133,73 @@ function Write-AuditLog {
 #endregion
 
 function Connect-WithCredentials {
-    # Check if already connected
-    if ($Script:Credential) {
-        [System.Windows.Forms.MessageBox]::Show(
-            "You are already connected as $($Script:Credential.UserName).`n`nDisconnect first if you want to connect with different credentials.",
-            "Already Connected",
-            "OK",
-            "Information"
-        )
-        return
-    }
-    
-    # Check for lockout
+    # Check if locked out
     if ($Script:AuthLockoutUntil -and (Get-Date) -lt $Script:AuthLockoutUntil) {
-        $TimeRemaining = [math]::Ceiling(($Script:AuthLockoutUntil - (Get-Date)).TotalMinutes)
+        $RemainingSeconds = ($Script:AuthLockoutUntil - (Get-Date)).TotalSeconds
         [System.Windows.Forms.MessageBox]::Show(
-            "Too many failed authentication attempts.`n`nPlease try again in $TimeRemaining minutes.",
-            "Authentication Locked",
+            "Too many failed attempts!`n`nLocked for $([math]::Ceiling($RemainingSeconds)) more seconds.",
+            "Account Protection",
             "OK",
             "Warning"
         )
-        return
+        Write-AuditLog -Action "Authentication" -Target "Blocked" -Result "RateLimited"
+        return $false
     }
     
-    # Create credential dialog
-    $CredentialForm = New-Object System.Windows.Forms.Form
-    $CredentialForm.Text = "Enter Credentials"
-    $CredentialForm.Size = New-Object System.Drawing.Size(400, 250)
-    $CredentialForm.StartPosition = "CenterParent"
-    $CredentialForm.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
-    $CredentialForm.MaximizeBox = $false
-    $CredentialForm.MinimizeBox = $false
+    $NewCredential = Get-Credential -Message "Enter domain credentials for server access"
     
-    $TitleLabel = New-Object System.Windows.Forms.Label
-    $TitleLabel.Text = "Enter Domain Credentials"
-    $TitleLabel.Font = New-Object System.Drawing.Font("Segoe UI", 12, [System.Drawing.FontStyle]::Bold)
-    $TitleLabel.Location = New-Object System.Drawing.Point(20, 20)
-    $TitleLabel.Size = New-Object System.Drawing.Size(360, 25)
-    $CredentialForm.Controls.Add($TitleLabel)
-    
-    $UsernameLabel = New-Object System.Windows.Forms.Label
-    $UsernameLabel.Text = "Username:"
-    $UsernameLabel.Location = New-Object System.Drawing.Point(20, 60)
-    $UsernameLabel.Size = New-Object System.Drawing.Size(100, 20)
-    $CredentialForm.Controls.Add($UsernameLabel)
-    
-    $UsernameTextBox = New-Object System.Windows.Forms.TextBox
-    $UsernameTextBox.Location = New-Object System.Drawing.Point(130, 60)
-    $UsernameTextBox.Size = New-Object System.Drawing.Size(230, 20)
-    $CredentialForm.Controls.Add($UsernameTextBox)
-    
-    $PasswordLabel = New-Object System.Windows.Forms.Label
-    $PasswordLabel.Text = "Password:"
-    $PasswordLabel.Location = New-Object System.Drawing.Point(20, 90)
-    $PasswordLabel.Size = New-Object System.Drawing.Size(100, 20)
-    $CredentialForm.Controls.Add($PasswordLabel)
-    
-    $PasswordTextBox = New-Object System.Windows.Forms.MaskedTextBox
-    $PasswordTextBox.PasswordChar = '*'
-    $PasswordTextBox.Location = New-Object System.Drawing.Point(130, 90)
-    $PasswordTextBox.Size = New-Object System.Drawing.Size(230, 20)
-    $CredentialForm.Controls.Add($PasswordTextBox)
-    
-    $InfoLabel = New-Object System.Windows.Forms.Label
-    $InfoLabel.Text = "Enter domain credentials with appropriate permissions for validation tasks."
-    $InfoLabel.Location = New-Object System.Drawing.Point(20, 120)
-    $InfoLabel.Size = New-Object System.Drawing.Size(360, 40)
-    $InfoLabel.Font = New-Object System.Drawing.Font("Segoe UI", 8)
-    $CredentialForm.Controls.Add($InfoLabel)
-    
-    $OKButton = New-Object System.Windows.Forms.Button
-    $OKButton.Text = "OK"
-    $OKButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
-    $OKButton.Location = New-Object System.Drawing.Point(130, 170)
-    $OKButton.Size = New-Object System.Drawing.Size(100, 30)
-    $CredentialForm.Controls.Add($OKButton)
-    $CredentialForm.AcceptButton = $OKButton
-    
-    $CancelButton = New-Object System.Windows.Forms.Button
-    $CancelButton.Text = "Cancel"
-    $CancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-    $CancelButton.Location = New-Object System.Drawing.Point(260, 170)
-    $CancelButton.Size = New-Object System.Drawing.Size(100, 30)
-    $CredentialForm.Controls.Add($CancelButton)
-    $CredentialForm.CancelButton = $CancelButton
-    
-    $Result = $CredentialForm.ShowDialog()
-    
-    if ($Result -eq [System.Windows.Forms.DialogResult]::OK) {
-        $Username = $UsernameTextBox.Text
-        $Password = $PasswordTextBox.Text
+    if ($NewCredential) {
+        Update-Status "Validating credentials..."
         
-        if ([string]::IsNullOrWhiteSpace($Username) -or [string]::IsNullOrWhiteSpace($Password)) {
+        $ValidationResult = Test-CredentialValidity -Credential $NewCredential
+        
+        if ($ValidationResult.Valid) {
+            # SUCCESS - Reset everything
+            $Script:AuthAttempts = 0
+            $Script:AuthLockoutUntil = $null
+            $Script:Credential = $NewCredential
+            $Script:ConnectionStatus.Clear()
+            
+            Write-AuditLog -Action "Authentication" -Target $Script:Credential.UserName -Result "Success"
+            
+            Update-CredentialDisplay
+            
             [System.Windows.Forms.MessageBox]::Show(
-                "Username and password cannot be empty.",
-                "Invalid Credentials",
+                "Connected successfully as: $($Script:Credential.UserName)`n`nCredentials have been validated.",
+                "Authentication Successful",
                 "OK",
-                "Warning"
+                "Information"
             )
-            return
+            Update-Status "Connected as: $($Script:Credential.UserName)"
+            return $true
         }
-        
-        try {
-            $SecurePassword = ConvertTo-SecureString $Password -AsPlainText -Force
-            $Credential = New-Object System.Management.Automation.PSCredential($Username, $SecurePassword)
+        else {
+            # FAILURE - Count attempts
+            $Script:AuthAttempts++
             
-            Update-Status "Validating credentials..."
-            $ValidationResult = Test-CredentialValidity -Credential $Credential
+            Write-AuditLog -Action "Authentication" -Target $NewCredential.UserName -Result "Failed" -Details "Attempt $Script:AuthAttempts of 3"
             
-            if ($ValidationResult.Valid) {
-                $Script:Credential = $Credential
-                $Script:AuthAttempts = 0
-                $Script:AuthLockoutUntil = $null
-                
-                Update-Status "Connected as $Username"
-                Update-CredentialDisplay
-                
-                # Check permissions
-                $PermissionCheck = Test-ComprehensivePermissions -Credential $Credential
-                
-                $CanValidateCount = 0
-                if ($PermissionCheck.CanValidateSystemUtil) { $CanValidateCount++ }
-                if ($PermissionCheck.CanValidateAD) { $CanValidateCount++ }
-                if ($PermissionCheck.CanValidateExchange) { $CanValidateCount++ }
-                if ($PermissionCheck.CanValidateADFS) { $CanValidateCount++ }
-                if ($PermissionCheck.CanValidateAADConnect) { $CanValidateCount++ }
-                
+            if ($Script:AuthAttempts -ge 3) {
+                # LOCK for 5 minutes
+                $Script:AuthLockoutUntil = (Get-Date).AddMinutes(5)
                 [System.Windows.Forms.MessageBox]::Show(
-                    "Connected successfully as $Username`n`nPermission Summary: $($PermissionCheck.Summary)",
-                    "Connection Successful",
+                    "Too many failed authentication attempts!`n`nLocked for 5 minutes for security protection.`n`nPlease verify your username and password.",
+                    "Account Protection - Locked",
                     "OK",
-                    "Information"
+                    "Warning"
                 )
-                
-                Write-AuditLog -Action "Connect" -Target $Username -Result "Success" -Details $PermissionCheck.Summary
-                
-                return $true
+            } else {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Authentication Failed!`n`n$($ValidationResult.Message)`n`nAttempt $Script:AuthAttempts of 3",
+                    "Authentication Failed",
+                    "OK",
+                    "Error"
+                )
             }
-            else {
-                $Script:AuthAttempts++
-                
-                if ($Script:AuthAttempts -ge $Script:Thresholds.MaxAuthAttempts) {
-                    $Script:AuthLockoutUntil = (Get-Date).AddMinutes($Script:Thresholds.AuthLockoutMinutes)
-                    
-                    [System.Windows.Forms.MessageBox]::Show(
-                        "Too many failed authentication attempts.`n`nAuthentication is locked for $($Script:Thresholds.AuthLockoutMinutes) minutes.",
-                        "Authentication Locked",
-                        "OK",
-                        "Warning"
-                    )
-                    
-                    Write-AuditLog -Action "Connect" -Target $Username -Result "Lockout" -Details "Too many failed attempts"
-                }
-                else {
-                    [System.Windows.Forms.MessageBox]::Show(
-                        "Authentication failed: $($ValidationResult.Message)`n`nAttempts remaining: $($Script:Thresholds.MaxAuthAttempts - $Script:AuthAttempts)",
-                        "Authentication Failed",
-                        "OK",
-                        "Warning"
-                    )
-                    
-                    Write-AuditLog -Action "Connect" -Target $Username -Result "Failed" -Details $ValidationResult.Message
-                }
-                
-                return $false
-            }
-        }
-        catch {
-            [System.Windows.Forms.MessageBox]::Show(
-                "Error creating credential: $($_.Exception.Message)",
-                "Error",
-                "OK",
-                "Error"
-            )
-            
-            Write-AuditLog -Action "Connect" -Target $Username -Result "Error" -Details $_.Exception.Message
+            Update-Status "Authentication failed"
             return $false
         }
     }
-    
     return $false
 }
 
@@ -1361,6 +1036,31 @@ function Test-ServerConnection {
     }
 }
 
+<#
+function Invoke-SafeRemoteCommand {
+    param(
+        [string]$ServerName,
+        [scriptblock]$ScriptBlock,
+        [System.Management.Automation.PSCredential]$Credential
+    )
+    $ConnectionInfo = $Script:ConnectionStatus[$ServerName]
+    if (-not $ConnectionInfo -or $ConnectionInfo.Status -ne 'Connected') {
+        return @{ Success = $false; Data = $null; Error = "Not connected" }
+    }
+    try {
+        # ALWAYS use credentials when provided - never fall back to current session
+        if ($Credential) {
+            $Result = Invoke-Command -ComputerName $ServerName -ScriptBlock $ScriptBlock -Credential $Credential -ErrorAction Stop
+        } else {
+            return @{ Success = $false; Data = $null; Error = "No credentials provided" }
+        }
+        return @{ Success = $true; Data = $Result; Error = $null }
+    }
+    catch {
+        return @{ Success = $false; Data = $null; Error = $_.Exception.Message }
+    }
+}
+#>
 function Invoke-SafeRemoteCommand {
     param(
         [string]$ServerName,
@@ -1368,16 +1068,6 @@ function Invoke-SafeRemoteCommand {
         [System.Management.Automation.PSCredential]$Credential,
         [int]$TimeoutSeconds = 300
     )
-    
-    # SAFETY CHECK - Verify scriptblock is read-only
-    if (-not (Test-ScriptSafety -ScriptBlock $ScriptBlock)) {
-        return @{ 
-            Success = $false
-            Data = $null
-            Error = "Script block contains prohibited operations"
-            ErrorCode = "SAFETY_BLOCK"
-        }
-    }
     
     if (-not $Credential) {
         return @{ 
@@ -1389,31 +1079,13 @@ function Invoke-SafeRemoteCommand {
     }
     
     try {
-        # Add -AsJob for timeout capability
-        $Job = Invoke-Command -ComputerName $ServerName -ScriptBlock $ScriptBlock -Credential $Credential -AsJob
-        $Completed = Wait-Job -Job $Job -Timeout $TimeoutSeconds
+        $Result = Invoke-Command -ComputerName $ServerName -ScriptBlock $ScriptBlock -Credential $Credential -ErrorAction Stop
         
-        if ($Completed) {
-            $Result = Receive-Job -Job $Job
-            Remove-Job -Job $Job -Force
-            
-            return @{ 
-                Success = $true
-                Data = $Result
-                Error = $null
-                ErrorCode = $null
-            }
-        }
-        else {
-            Stop-Job -Job $Job
-            Remove-Job -Job $Job -Force
-            
-            return @{
-                Success = $false
-                Data = $null
-                Error = "Operation timed out after $TimeoutSeconds seconds"
-                ErrorCode = "TIMEOUT"
-            }
+        return @{ 
+            Success = $true
+            Data = $Result
+            Error = $null
+            ErrorCode = $null
         }
     }
     catch {
@@ -2468,91 +2140,19 @@ function Test-ExchangeComprehensive {
             }
         } catch {}
         try {
-        # Test actual web browsing capability, not just ICMP ping
-        $InternetTests = @()
-        
-        # Test 1: HTTP/HTTPS to multiple reliable endpoints
-        $TestSites = @(
-            @{URL="http://www.msftconnecttest.com/connecttest.txt"; Name="Microsoft"},
-            @{URL="http://detectportal.firefox.com/success.txt"; Name="Mozilla"},
-            @{URL="http://clients3.google.com/generate_204"; Name="Google"}
-        )
-        
-        $SuccessfulTests = 0
-        $FailedTests = 0
-        $TestDetails = @()
-        
-        foreach ($Site in $TestSites) {
-            try {
-                $Response = Invoke-WebRequest -Uri $Site.URL -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
-                if ($Response.StatusCode -eq 200 -or $Response.StatusCode -eq 204) {
-                    $SuccessfulTests++
-                    $TestDetails += "$($Site.Name): Accessible"
-                }
-                else {
-                    $FailedTests++
-                    $TestDetails += "$($Site.Name): HTTP $($Response.StatusCode)"
-                }
-            }
-            catch {
-                $FailedTests++
-                $TestDetails += "$($Site.Name): Blocked/Failed"
-            }
-        }
-        
-        # Determine final status
-        if ($SuccessfulTests -eq 0) {
-            # No internet access - COMPLIANT (as expected for secure infrastructure)
+            $InternetTest = Test-Connection -ComputerName "8.8.8.8" -Count 1 -Quiet -ErrorAction SilentlyContinue
             $Results.InternetAccess += [PSCustomObject]@{
-                Check = "Web Browsing Test"
-                Result = "No Internet Access (Compliant)"
-                Details = "All HTTP/HTTPS requests blocked"
+                Check = "Internet Connectivity"
+                Result = if ($InternetTest) { "HAS INTERNET ACCESS" } else { "No Internet (Compliant)" }
+                Status = if ($InternetTest) { "SECURITY RISK" } else { "OK" }
+            }
+        } catch {
+            $Results.InternetAccess += [PSCustomObject]@{
+                Check = "Internet Connectivity"
+                Result = "No Internet (Compliant)"
                 Status = "OK"
             }
         }
-        elseif ($SuccessfulTests -eq $TestSites.Count) {
-            # Full internet access - SECURITY RISK
-            $Results.InternetAccess += [PSCustomObject]@{
-                Check = "Web Browsing Test"
-                Result = "FULL INTERNET ACCESS DETECTED"
-                Details = "All test sites accessible: $($TestDetails -join ' | ')"
-                Status = "SECURITY RISK"
-            }
-        }
-        else {
-            # Partial internet access - WARNING
-            $Results.InternetAccess += [PSCustomObject]@{
-                Check = "Web Browsing Test"
-                Result = "Partial Internet Access"
-                Details = "$SuccessfulTests of $($TestSites.Count) sites accessible: $($TestDetails -join ' | ')"
-                Status = "WARNING"
-            }
-        }
-        
-        # Test 2: DNS Resolution (can resolve but not browse?)
-        try {
-            $DNSTest = Resolve-DnsName -Name "www.microsoft.com" -Type A -ErrorAction Stop
-            $DNSWorks = $true
-        }
-        catch {
-            $DNSWorks = $false
-        }
-        
-        $Results.InternetAccess += [PSCustomObject]@{
-            Check = "DNS Resolution"
-            Result = if ($DNSWorks) { "DNS Working" } else { "DNS Blocked/Failed" }
-            Details = if ($DNSWorks) { "Can resolve external domains" } else { "Cannot resolve external domains" }
-            Status = if ($DNSWorks -and $SuccessfulTests -eq 0) { "INFO" } elseif ($DNSWorks) { "OK" } else { "OK" }
-        }
-    }
-    catch {
-        $Results.InternetAccess += [PSCustomObject]@{
-            Check = "Internet Connectivity Test"
-            Result = "Test Failed"
-            Details = $_.Exception.Message
-            Status = "ERROR"
-        }
-    }
         return $Results
     }
     catch {
@@ -6426,7 +6026,7 @@ function Export-ValidationCSV {
             }
             
             $CSVData += [PSCustomObject]@{
-                'Category' = 'Author: Nournet - MSTeam'
+                'Category' = 'Author: Hisham Nasur - NN - MS Operation'
                 'Item' = ''
                 'Details' = ''
                 'Status' = ''
@@ -7081,7 +6681,7 @@ function Generate-HTMLReport {
                     </div>
                     <div class="meta-item">
                         <div class="label">Created By</div>
-                        <div class="value">Nournet - MSTeam</div>
+                        <div class="value">Hisham Nasur - NN - MS Operation</div>
                     </div>
                 </div>
             </div>
@@ -7106,7 +6706,7 @@ SERVER_CONTENT
                     Professional infrastructure health assessment and documentation system
                 </p>
                 <div class="footer-logo">
-                    <strong>2025 Nournet - MSTeam</strong><br>
+                    <strong>2025 Hisham Nasur - NN - MS Operation</strong><br>
                     Infrastructure Handover Validation Tool | Version 1.0
                 </div>
             </div>
@@ -7651,7 +7251,7 @@ function Show-ValidationGUI {
     $HeaderPanel.Controls.Add($TitleLabel)
     
     $VersionLabel = New-Object System.Windows.Forms.Label
-    $VersionLabel.Text = "Version 1.0  |  Created by: Nournet - MSTeam"
+    $VersionLabel.Text = "Version 1.0  |  Created by: Hisham Nasur - NN - MS Operation"
     $VersionLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10)
     $VersionLabel.ForeColor = [System.Drawing.Color]::FromArgb(189, 195, 199)
     $VersionLabel.Location = New-Object System.Drawing.Point(35, 60)
@@ -7743,7 +7343,7 @@ function Show-ValidationGUI {
     $Step3Panel.Controls.Add($Step3Number)
     
     $Step3Text = New-Object System.Windows.Forms.Label
-    $Step3Text.Text = "EXPORT RESULTS - Generate professional HTML or CSV reports for documentation"
+    $Step3Text.Text = "EXPORT RESULTS - Generate professional HTML reports for documentation"
     $Step3Text.Font = New-Object System.Drawing.Font("Segoe UI", 10)
     $Step3Text.ForeColor = [System.Drawing.Color]::FromArgb(44, 62, 80)
     $Step3Text.Location = New-Object System.Drawing.Point(45, 9)
