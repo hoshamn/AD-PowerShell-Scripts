@@ -34,14 +34,11 @@ $Global:ProgressLabel = $null
 $Global:ProgressTotalSteps = 0
 $Global:ProgressCurrentStep = 0
 $Global:ValidationInProgress = $false
-$Global:CurrentValidationName = ""
-# NEW: Validation mutex for exclusive execution
-$Script:ValidationMutex = New-Object System.Threading.Mutex($false, "InfrastructureValidationMutex")
 
 # Configuration Thresholds
 $Script:Thresholds = @{
-    DiskWarningPercent = 80      # Changed from 85
-    DiskCriticalPercent = 90     # Changed from 95
+    DiskWarningPercent = 85
+    DiskCriticalPercent = 95
     CPUHighPercent = 80
     MemoryHighPercent = 90
     CertificateExpiryWarningDays = 30
@@ -909,10 +906,9 @@ function Show-PermissionCheckDialog {
 function Start-ValidationProgress {
     param([string]$ValidationName, [int]$TotalSteps)
     
-    # CRITICAL: Check if another validation is running
     if ($Global:ValidationInProgress) {
         [System.Windows.Forms.MessageBox]::Show(
-            "A validation is already in progress!`n`nPlease wait for the current validation to complete before starting another.`n`nCurrent validation: $Global:CurrentValidationName",
+            "A validation is already in progress!`n`nPlease wait for the current validation to complete before starting another.",
             "Validation In Progress",
             "OK",
             "Warning"
@@ -920,27 +916,7 @@ function Start-ValidationProgress {
         return $false
     }
     
-    # NEW: Try to acquire mutex (with timeout)
-    try {
-        $acquired = $Script:ValidationMutex.WaitOne(100)  # 100ms timeout
-        if (-not $acquired) {
-            [System.Windows.Forms.MessageBox]::Show(
-                "Another validation process is running.`n`nOnly one validation can run at a time.`n`nPlease wait and try again.",
-                "Validation Locked",
-                "OK",
-                "Warning"
-            )
-            return $false
-        }
-    }
-    catch {
-        Write-Warning "Mutex error: $($_.Exception.Message)"
-        return $false
-    }
-    
-    # Set global lock
     $Global:ValidationInProgress = $true
-    $Global:CurrentValidationName = $ValidationName
     
     if ($Global:ProgressContainer) {
         $Global:ProgressContainer.Visible = $true
@@ -993,6 +969,8 @@ function Update-ValidationProgress {
 function Complete-ValidationProgress {
     param([string]$CompletionMessage)
     
+    $Global:ValidationInProgress = $false
+    
     if ($Global:ProgressFill -and $Global:ProgressContainer) {
         # Fill to 100%
         $Global:ProgressFill.Width = $Global:ProgressContainer.Width
@@ -1013,18 +991,6 @@ function Complete-ValidationProgress {
         $Global:ProgressFill.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
     }
     
-    # NEW: Release mutex
-    try {
-        $Script:ValidationMutex.ReleaseMutex()
-    }
-    catch {
-        Write-Warning "Mutex release error: $($_.Exception.Message)"
-    }
-    
-    # Clear global lock
-    $Global:ValidationInProgress = $false
-    $Global:CurrentValidationName = ""
-    
     Update-Status $CompletionMessage
 }
 
@@ -1034,208 +1000,6 @@ function Update-Status {
         $Global:StatusLabel.Text = $StatusText
         $Global:StatusLabel.Refresh()
         [System.Windows.Forms.Application]::DoEvents()
-    }
-}
-
-function Test-InternetAccess {
-    <#
-    .SYNOPSIS
-        Centralized internet connectivity check
-    #>
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$ServerName,
-        
-        [Parameter(Mandatory=$true)]
-        [System.Management.Automation.PSCredential]$Credential
-    )
-    
-    Write-Verbose "Test-InternetAccess called for server: $ServerName"
-    
-    # Validate inputs
-    if ([string]::IsNullOrWhiteSpace($ServerName)) {
-        Write-Warning "ServerName is empty in Test-InternetAccess"
-        return @{ 
-            Success = $false
-            Data = @([PSCustomObject]@{
-                Check = "Configuration Error"
-                Result = "No server specified"
-                Details = "ServerName parameter is missing"
-                Status = "ERROR"
-            })
-            Error = "Missing ServerName"
-        }
-    }
-    
-    if (-not $Credential) {
-        Write-Warning "Credential is null in Test-InternetAccess"
-        return @{ 
-            Success = $false
-            Data = @([PSCustomObject]@{
-                Check = "Configuration Error"
-                Result = "No credentials provided"
-                Details = "Credential parameter is missing"
-                Status = "ERROR"
-            })
-            Error = "Missing Credential"
-        }
-    }
-    
-    # Script block to run on remote server
-    $ScriptBlock = {
-        $InternetResults = @()
-        
-        try {
-            # Test 1: Web Browsing
-            $TestSites = @(
-                @{URL="http://www.msftconnecttest.com/connecttest.txt"; Name="Microsoft"},
-                @{URL="http://detectportal.firefox.com/success.txt"; Name="Mozilla"},
-                @{URL="http://clients3.google.com/generate_204"; Name="Google"}
-            )
-            
-            $SuccessfulTests = 0
-            $TestDetails = @()
-            
-            foreach ($Site in $TestSites) {
-                try {
-                    $Response = Invoke-WebRequest -Uri $Site.URL -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
-                    if ($Response.StatusCode -eq 200 -or $Response.StatusCode -eq 204) {
-                        $SuccessfulTests++
-                        $TestDetails += "$($Site.Name): Accessible"
-                    }
-                }
-                catch {
-                    $TestDetails += "$($Site.Name): Blocked"
-                }
-            }
-            
-            # Result
-            if ($SuccessfulTests -eq 0) {
-                $InternetResults += [PSCustomObject]@{
-                    Check = "Web Browsing Test"
-                    Result = "No Internet Access (Compliant)"
-                    Details = "All HTTP/HTTPS requests blocked"
-                    Status = "OK"
-                }
-            }
-            elseif ($SuccessfulTests -eq $TestSites.Count) {
-                $InternetResults += [PSCustomObject]@{
-                    Check = "Web Browsing Test"
-                    Result = "FULL INTERNET ACCESS DETECTED"
-                    Details = "All test sites accessible"
-                    Status = "SECURITY RISK"
-                }
-            }
-            else {
-                $InternetResults += [PSCustomObject]@{
-                    Check = "Web Browsing Test"
-                    Result = "Partial Internet Access"
-                    Details = "$SuccessfulTests of 3 sites accessible"
-                    Status = "WARNING"
-                }
-            }
-            
-            # Test 2: DNS
-            try {
-                $null = Resolve-DnsName -Name "www.microsoft.com" -Type A -ErrorAction Stop
-                $InternetResults += [PSCustomObject]@{
-                    Check = "DNS Resolution"
-                    Result = "DNS Working"
-                    Details = "Can resolve external domains"
-                    Status = "INFO"
-                }
-            }
-            catch {
-                $InternetResults += [PSCustomObject]@{
-                    Check = "DNS Resolution"
-                    Result = "DNS Blocked"
-                    Details = "Cannot resolve external domains"
-                    Status = "OK"
-                }
-            }
-            
-            # Test 3: Proxy
-            try {
-                $ProxySettings = Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" -ErrorAction SilentlyContinue
-                if ($ProxySettings -and $ProxySettings.ProxyEnable -eq 1) {
-                    $InternetResults += [PSCustomObject]@{
-                        Check = "Proxy Configuration"
-                        Result = "Proxy Enabled"
-                        Details = "Server: $($ProxySettings.ProxyServer)"
-                        Status = "INFO"
-                    }
-                }
-                else {
-                    $InternetResults += [PSCustomObject]@{
-                        Check = "Proxy Configuration"
-                        Result = "No Proxy"
-                        Details = "Direct connection"
-                        Status = "INFO"
-                    }
-                }
-            }
-            catch {
-                $InternetResults += [PSCustomObject]@{
-                    Check = "Proxy Configuration"
-                    Result = "Unable to check"
-                    Details = "Registry access failed"
-                    Status = "INFO"
-                }
-            }
-            
-            # Test 4: Firewall
-            try {
-                $Firewall = Get-NetFirewallProfile -ErrorAction SilentlyContinue
-                if ($Firewall) {
-                    $Enabled = ($Firewall | Where-Object {$_.Enabled}).Name -join ", "
-                    $InternetResults += [PSCustomObject]@{
-                        Check = "Windows Firewall"
-                        Result = if ($Enabled) { "Enabled" } else { "Disabled" }
-                        Details = if ($Enabled) { "Profiles: $Enabled" } else { "No active profiles" }
-                        Status = if ($Enabled) { "OK" } else { "WARNING" }
-                    }
-                }
-            }
-            catch {
-                $InternetResults += [PSCustomObject]@{
-                    Check = "Windows Firewall"
-                    Result = "Check Failed"
-                    Details = $_.Exception.Message
-                    Status = "INFO"
-                }
-            }
-            
-            return $InternetResults
-        }
-        catch {
-            return @([PSCustomObject]@{
-                Check = "Internet Test"
-                Result = "Failed"
-                Details = $_.Exception.Message
-                Status = "ERROR"
-            })
-        }
-    }
-    
-    # Execute remotely
-    try {
-        Write-Verbose "Executing internet check on $ServerName"
-        $Result = Invoke-SafeRemoteCommand -ServerName $ServerName -ScriptBlock $ScriptBlock -Credential $Credential
-        Write-Verbose "Internet check completed. Success: $($Result.Success)"
-        return $Result
-    }
-    catch {
-        Write-Warning "Test-InternetAccess failed: $($_.Exception.Message)"
-        return @{ 
-            Success = $false
-            Data = @([PSCustomObject]@{
-                Check = "Remote Execution"
-                Result = "Failed"
-                Details = $_.Exception.Message
-                Status = "ERROR"
-            })
-            Error = $_.Exception.Message
-        }
     }
 }
 
@@ -1597,20 +1361,6 @@ function Get-ServerDetails {
             $FreeGB = [math]::Round($Disk.FreeSpace / 1GB, 2)
             $UsedGB = $TotalGB - $FreeGB
             $UsagePercent = if ($TotalGB -gt 0) { [math]::Round(($UsedGB / $TotalGB) * 100, 2) } else { 0 }
-
-            # NEW: Enhanced disk status logic with 80% and 90% thresholds
-            $DiskStatus = "Normal"
-            $StatusMessage = "Healthy"
-
-            if ($UsagePercent -ge 90) {
-                $DiskStatus = "Critical"
-                $StatusMessage = "CRITICAL - Immediate Action Required"
-            }
-            elseif ($UsagePercent -ge 80) {
-                $DiskStatus = "Warning"
-                $StatusMessage = "WARNING - Monitor Closely"
-            }
-
             $ServerDetails.Disks += [PSCustomObject]@{
                 Drive = $Disk.DeviceID
                 Label = if ($Disk.VolumeName) { $Disk.VolumeName } else { "No Label" }
@@ -1619,8 +1369,7 @@ function Get-ServerDetails {
                 UsedSpace = "$UsedGB GB"
                 FreeSpace = "$FreeGB GB"
                 UsagePercent = "$UsagePercent%"
-                Status = $DiskStatus
-                Message = $StatusMessage
+                Status = if ($UsagePercent -lt $Script:Thresholds.DiskWarningPercent) { "Normal" } elseif ($UsagePercent -lt $Script:Thresholds.DiskCriticalPercent) { "Warning" } else { "Critical" }
             }
         }
         $ServiceList = @(
@@ -1710,23 +1459,13 @@ function Get-ServerUtilization {
                 $FreeGB = [math]::Round($Disk.FreeSpace / 1GB, 2)
                 $UsedGB = $TotalGB - $FreeGB
                 $UsagePercent = if ($TotalGB -gt 0) { [math]::Round(($UsedGB / $TotalGB) * 100, 2) } else { 0 }
-
-                # Enhanced status logic with 80/90 thresholds
-                $DiskStatus = "Normal"
-                if ($UsagePercent -ge 90) {
-                    $DiskStatus = "Critical"
-                }
-                elseif ($UsagePercent -ge 80) {
-                    $DiskStatus = "Warning"
-                }
-
                 $Results.Disks += [PSCustomObject]@{
                     Drive = $Disk.DeviceID
                     Total = "$TotalGB GB"
                     Used = "$UsedGB GB"
                     Free = "$FreeGB GB"
                     Usage = "$UsagePercent%"
-                    Status = $DiskStatus
+                    Status = if ($UsagePercent -lt 85) { "Normal" } elseif ($UsagePercent -lt 95) { "Warning" } else { "Critical" }
                 }
             }
         }
@@ -2400,69 +2139,21 @@ function Test-ExchangeComprehensive {
                 }
             }
         } catch {}
-        # Use centralized internet check
-        # Internet Access Check - SELF-CONTAINED
         try {
-            $ScriptBlock = {
-                $InternetResults = @()
-                
-                # Test web browsing
-                try {
-                    $TestSites = @(
-                        @{URL="http://www.msftconnecttest.com/connecttest.txt"; Name="Microsoft"},
-                        @{URL="http://detectportal.firefox.com/success.txt"; Name="Mozilla"},
-                        @{URL="http://clients3.google.com/generate_204"; Name="Google"}
-                    )
-                    
-                    $SuccessCount = 0
-                    foreach ($Site in $TestSites) {
-                        try {
-                            $Response = Invoke-WebRequest -Uri $Site.URL -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
-                            if ($Response.StatusCode -eq 200 -or $Response.StatusCode -eq 204) {
-                                $SuccessCount++
-                            }
-                        }
-                        catch {}
-                    }
-                    
-                    if ($SuccessCount -eq 0) {
-                        $InternetResults += [PSCustomObject]@{
-                            Check = "Internet Connectivity"
-                            Result = "No Internet Access (Compliant)"
-                            Status = "OK"
-                        }
-                    }
-                    else {
-                        $InternetResults += [PSCustomObject]@{
-                            Check = "Internet Connectivity"
-                            Result = "HAS INTERNET ACCESS"
-                            Status = "SECURITY RISK"
-                        }
-                    }
-                }
-                catch {
-                    $InternetResults += [PSCustomObject]@{
-                        Check = "Internet Connectivity"
-                        Result = "No Internet (Compliant)"
-                        Status = "OK"
-                    }
-                }
-                
-                return $InternetResults
+            $InternetTest = Test-Connection -ComputerName "8.8.8.8" -Count 1 -Quiet -ErrorAction SilentlyContinue
+            $Results.InternetAccess += [PSCustomObject]@{
+                Check = "Internet Connectivity"
+                Result = if ($InternetTest) { "HAS INTERNET ACCESS" } else { "No Internet (Compliant)" }
+                Status = if ($InternetTest) { "SECURITY RISK" } else { "OK" }
             }
-            
-            $RemoteResult = Invoke-SafeRemoteCommand -ServerName $ServerName -ScriptBlock $ScriptBlock -Credential $Credential
-            if ($RemoteResult.Success -and $RemoteResult.Data) {
-                $Results.InternetAccess = $RemoteResult.Data
-            }
-        }
-        catch {
+        } catch {
             $Results.InternetAccess += [PSCustomObject]@{
                 Check = "Internet Connectivity"
                 Result = "No Internet (Compliant)"
                 Status = "OK"
             }
         }
+        return $Results
     }
     catch {
         return $null
@@ -3998,177 +3689,145 @@ function Test-ActiveDirectoryComprehensive {
             }
         }
         
-        # 15. Verify No Internet Access - SELF-CONTAINED VERSION
+        # 15. Verify No Internet Access
         try {
-            # Test internet access directly without calling external function
-            $ScriptBlock = {
-                $InternetResults = @()
-                
+            # Test actual web browsing capability, not just ICMP ping
+            $InternetTests = @()
+            
+            # Test 1: HTTP/HTTPS to multiple reliable endpoints
+            $TestSites = @(
+                @{URL="http://www.msftconnecttest.com/connecttest.txt"; Name="Microsoft"},
+                @{URL="http://detectportal.firefox.com/success.txt"; Name="Mozilla"},
+                @{URL="http://clients3.google.com/generate_204"; Name="Google"}
+            )
+            
+            $SuccessfulTests = 0
+            $FailedTests = 0
+            $TestDetails = @()
+            
+            foreach ($Site in $TestSites) {
                 try {
-                    # Test 1: HTTP/HTTPS Web Browsing
-                    $TestSites = @(
-                        @{URL="http://www.msftconnecttest.com/connecttest.txt"; Name="Microsoft"},
-                        @{URL="http://detectportal.firefox.com/success.txt"; Name="Mozilla"},
-                        @{URL="http://clients3.google.com/generate_204"; Name="Google"}
-                    )
-                    
-                    $SuccessCount = 0
-                    $TestDetails = @()
-                    
-                    foreach ($Site in $TestSites) {
-                        try {
-                            $Response = Invoke-WebRequest -Uri $Site.URL -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
-                            if ($Response.StatusCode -eq 200 -or $Response.StatusCode -eq 204) {
-                                $SuccessCount++
-                                $TestDetails += "$($Site.Name): Accessible"
-                            }
-                        }
-                        catch {
-                            $TestDetails += "$($Site.Name): Blocked"
-                        }
-                    }
-                    
-                    # Determine result
-                    if ($SuccessCount -eq 0) {
-                        $InternetResults += [PSCustomObject]@{
-                            Check = "Web Browsing Test"
-                            Result = "No Internet Access (Compliant)"
-                            Details = "All HTTP/HTTPS requests blocked"
-                            Status = "OK"
-                        }
-                    }
-                    elseif ($SuccessCount -eq $TestSites.Count) {
-                        $InternetResults += [PSCustomObject]@{
-                            Check = "Web Browsing Test"
-                            Result = "FULL INTERNET ACCESS DETECTED"
-                            Details = "All test sites accessible: $($TestDetails -join ' | ')"
-                            Status = "SECURITY RISK"
-                        }
+                    $Response = Invoke-WebRequest -Uri $Site.URL -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
+                    if ($Response.StatusCode -eq 200 -or $Response.StatusCode -eq 204) {
+                        $SuccessfulTests++
+                        $TestDetails += "$($Site.Name): Accessible"
                     }
                     else {
-                        $InternetResults += [PSCustomObject]@{
-                            Check = "Web Browsing Test"
-                            Result = "Partial Internet Access"
-                            Details = "$SuccessCount of $($TestSites.Count) sites accessible: $($TestDetails -join ' | ')"
-                            Status = "WARNING"
-                        }
+                        $FailedTests++
+                        $TestDetails += "$($Site.Name): HTTP $($Response.StatusCode)"
                     }
                 }
                 catch {
-                    $InternetResults += [PSCustomObject]@{
-                        Check = "Web Browsing Test"
-                        Result = "Test Failed"
-                        Details = $_.Exception.Message
-                        Status = "ERROR"
-                    }
+                    $FailedTests++
+                    $TestDetails += "$($Site.Name): Blocked/Failed"
                 }
-                
-                # Test 2: DNS Resolution
-                try {
-                    $DNSTest = Resolve-DnsName -Name "www.microsoft.com" -Type A -ErrorAction Stop
-                    $InternetResults += [PSCustomObject]@{
-                        Check = "DNS Resolution"
-                        Result = "DNS Working"
-                        Details = "Can resolve external domains"
-                        Status = "INFO"
-                    }
-                }
-                catch {
-                    $InternetResults += [PSCustomObject]@{
-                        Check = "DNS Resolution"
-                        Result = "DNS Blocked/Failed"
-                        Details = "Cannot resolve external domains"
-                        Status = "OK"
-                    }
-                }
-                
-                # Test 3: Proxy Configuration
-                try {
-                    $ProxySettings = Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" -ErrorAction SilentlyContinue
-                    if ($ProxySettings -and $ProxySettings.ProxyEnable -eq 1) {
-                        $InternetResults += [PSCustomObject]@{
-                            Check = "Proxy Configuration"
-                            Result = "Proxy Configured"
-                            Details = "Proxy Server: $($ProxySettings.ProxyServer)"
-                            Status = "INFO"
-                        }
-                    }
-                    else {
-                        $InternetResults += [PSCustomObject]@{
-                            Check = "Proxy Configuration"
-                            Result = "No Proxy Configured"
-                            Details = "Direct connection settings"
-                            Status = "INFO"
-                        }
-                    }
-                }
-                catch {
-                    $InternetResults += [PSCustomObject]@{
-                        Check = "Proxy Configuration"
-                        Result = "Unable to check"
-                        Details = "Registry access failed"
-                        Status = "INFO"
-                    }
-                }
-                
-                # Test 4: Windows Firewall Status
-                try {
-                    $FirewallProfiles = Get-NetFirewallProfile -ErrorAction SilentlyContinue
-                    if ($FirewallProfiles) {
-                        $EnabledProfiles = ($FirewallProfiles | Where-Object { $_.Enabled -eq $true }).Name -join ", "
-                        
-                        if ($EnabledProfiles) {
-                            $InternetResults += [PSCustomObject]@{
-                                Check = "Windows Firewall"
-                                Result = "Enabled"
-                                Details = "Active Profiles: $EnabledProfiles"
-                                Status = "OK"
-                            }
-                        }
-                        else {
-                            $InternetResults += [PSCustomObject]@{
-                                Check = "Windows Firewall"
-                                Result = "Disabled"
-                                Details = "No firewall profiles active"
-                                Status = "WARNING"
-                            }
-                        }
-                    }
-                    else {
-                        $InternetResults += [PSCustomObject]@{
-                            Check = "Windows Firewall"
-                            Result = "Unable to check"
-                            Details = "Firewall service not available"
-                            Status = "INFO"
-                        }
-                    }
-                }
-                catch {
-                    $InternetResults += [PSCustomObject]@{
-                        Check = "Windows Firewall"
-                        Result = "Check Failed"
-                        Details = $_.Exception.Message
-                        Status = "INFO"
-                    }
-                }
-                
-                return $InternetResults
             }
             
-            # Execute the script block on remote server
-            $RemoteResult = Invoke-SafeRemoteCommand -ServerName $ServerName -ScriptBlock $ScriptBlock -Credential $Credential
-            
-            if ($RemoteResult.Success -and $RemoteResult.Data) {
-                foreach ($Item in $RemoteResult.Data) {
-                    $Results.InternetAccess += $Item
+            # Determine final status
+            if ($SuccessfulTests -eq 0) {
+                # No internet access - COMPLIANT (as expected for secure infrastructure)
+                $Results.InternetAccess += [PSCustomObject]@{
+                    Check = "Web Browsing Test"
+                    Result = "No Internet Access (Compliant)"
+                    Details = "All HTTP/HTTPS requests blocked"
+                    Status = "OK"
+                }
+            }
+            elseif ($SuccessfulTests -eq $TestSites.Count) {
+                # Full internet access - SECURITY RISK
+                $Results.InternetAccess += [PSCustomObject]@{
+                    Check = "Web Browsing Test"
+                    Result = "FULL INTERNET ACCESS DETECTED"
+                    Details = "All test sites accessible: $($TestDetails -join ' | ')"
+                    Status = "SECURITY RISK"
                 }
             }
             else {
+                # Partial internet access - WARNING
                 $Results.InternetAccess += [PSCustomObject]@{
-                    Check = "Internet Access Check"
-                    Result = "Failed to execute"
-                    Details = if ($RemoteResult.Error) { $RemoteResult.Error } else { "Unknown error" }
-                    Status = "ERROR"
+                    Check = "Web Browsing Test"
+                    Result = "Partial Internet Access"
+                    Details = "$SuccessfulTests of $($TestSites.Count) sites accessible: $($TestDetails -join ' | ')"
+                    Status = "WARNING"
+                }
+            }
+            
+            # Test 2: DNS Resolution (can resolve but not browse?)
+            try {
+                $DNSTest = Resolve-DnsName -Name "www.microsoft.com" -Type A -ErrorAction Stop
+                $DNSWorks = $true
+            }
+            catch {
+                $DNSWorks = $false
+            }
+            
+            $Results.InternetAccess += [PSCustomObject]@{
+                Check = "DNS Resolution"
+                Result = if ($DNSWorks) { "DNS Working" } else { "DNS Blocked/Failed" }
+                Details = if ($DNSWorks) { "Can resolve external domains" } else { "Cannot resolve external domains" }
+                Status = if ($DNSWorks -and $SuccessfulTests -eq 0) { "INFO" } elseif ($DNSWorks) { "OK" } else { "OK" }
+            }
+            
+            # Test 3: Proxy Detection
+            try {
+                $ProxySettings = Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" -ErrorAction SilentlyContinue
+                $ProxyEnabled = $ProxySettings.ProxyEnable -eq 1
+                $ProxyServer = $ProxySettings.ProxyServer
+                
+                if ($ProxyEnabled) {
+                    $Results.InternetAccess += [PSCustomObject]@{
+                        Check = "Proxy Configuration"
+                        Result = "Proxy Configured"
+                        Details = "Proxy Server: $ProxyServer"
+                        Status = "INFO"
+                    }
+                }
+                else {
+                    $Results.InternetAccess += [PSCustomObject]@{
+                        Check = "Proxy Configuration"
+                        Result = "No Proxy Configured"
+                        Details = "Direct connection settings"
+                        Status = "INFO"
+                    }
+                }
+            }
+            catch {
+                $Results.InternetAccess += [PSCustomObject]@{
+                    Check = "Proxy Configuration"
+                    Result = "Unable to check"
+                    Details = "Registry access failed"
+                    Status = "INFO"
+                }
+            }
+            
+            # Test 4: Windows Firewall Status
+            try {
+                $FirewallProfiles = Get-NetFirewallProfile -ErrorAction SilentlyContinue
+                $EnabledProfiles = ($FirewallProfiles | Where-Object { $_.Enabled -eq $true }).Name -join ", "
+                
+                if ($EnabledProfiles) {
+                    $Results.InternetAccess += [PSCustomObject]@{
+                        Check = "Windows Firewall"
+                        Result = "Enabled"
+                        Details = "Active Profiles: $EnabledProfiles"
+                        Status = "OK"
+                    }
+                }
+                else {
+                    $Results.InternetAccess += [PSCustomObject]@{
+                        Check = "Windows Firewall"
+                        Result = "Disabled"
+                        Details = "No firewall profiles active"
+                        Status = "WARNING"
+                    }
+                }
+            }
+            catch {
+                $Results.InternetAccess += [PSCustomObject]@{
+                    Check = "Windows Firewall"
+                    Result = "Unable to check"
+                    Details = $_.Exception.Message
+                    Status = "INFO"
                 }
             }
         }
@@ -5208,22 +4867,12 @@ function Show-UtilizationResults {
                 $DiskGrid.Add_DataBindingComplete({
                     foreach ($Row in $DiskGrid.Rows) {
                         $Status = $Row.Cells["Status"].Value
-                        $UsageCell = $Row.Cells["Usage"].Value
-                        
-                        # Extract percentage number
-                        if ($UsageCell -match '(\d+\.?\d*)%') {
-                            $UsageNum = [double]$Matches[1]
-                            
-                            if ($UsageNum -ge 90) {
-                                $Row.DefaultCellStyle.BackColor = $Script:Colors.Error
-                                $Row.DefaultCellStyle.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
-                            }
-                            elseif ($UsageNum -ge 80) {
-                                $Row.DefaultCellStyle.BackColor = $Script:Colors.Warning
-                            }
-                            else {
-                                $Row.DefaultCellStyle.BackColor = $Script:Colors.Success
-                            }
+                        if ($Status -eq "Normal") {
+                            $Row.DefaultCellStyle.BackColor = $Script:Colors.Success
+                        } elseif ($Status -eq "Warning") {
+                            $Row.DefaultCellStyle.BackColor = $Script:Colors.Warning
+                        } elseif ($Status -eq "Critical") {
+                            $Row.DefaultCellStyle.BackColor = $Script:Colors.Error
                         }
                     }
                 })
@@ -6866,6 +6515,7 @@ function Sanitize-HTMLContent {
 function Generate-HTMLReport {
     param([hashtable]$Results)
     
+    # Use here-string with proper escaping
     $HTML = @'
 <!DOCTYPE html>
 <html lang="en">
@@ -6881,329 +6531,376 @@ function Generate-HTMLReport {
         }
         
         body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: #F5F7FA;
             color: #2C3E50;
             line-height: 1.6;
             padding: 20px;
         }
         
-        .page-wrapper {
-            max-width: 1400px;
+        .container {
+            max-width: 1600px;
             margin: 0 auto;
+            background: #FFFFFF;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+            overflow: hidden;
         }
         
-        .report-header {
-            background: white;
-            border-radius: 15px;
-            padding: 40px;
-            margin-bottom: 30px;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+        .header {
+            background: linear-gradient(135deg, #1877F2 0%, #0A66C2 100%);
+            color: #FFFFFF;
+            padding: 40px 50px;
         }
         
-        .report-title {
-            font-size: 42px;
-            font-weight: 700;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            margin-bottom: 10px;
+        .header h1 {
+            font-size: 32px;
+            font-weight: 600;
+            margin-bottom: 8px;
+            letter-spacing: -0.5px;
         }
         
-        .report-subtitle {
-            font-size: 18px;
-            color: #7F8C8D;
-            margin-bottom: 30px;
+        .header .subtitle {
+            font-size: 16px;
+            font-weight: 400;
+            opacity: 0.9;
+            margin-bottom: 25px;
         }
         
-        .meta-grid {
+        .header .meta-info {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
             gap: 20px;
-            margin-top: 30px;
-            padding-top: 30px;
-            border-top: 2px solid #ECF0F1;
+            margin-top: 20px;
+            padding-top: 20px;
+            border-top: 1px solid rgba(255, 255, 255, 0.2);
         }
         
-        .meta-card {
-            background: #F8F9FA;
-            padding: 20px;
-            border-radius: 10px;
-            border-left: 4px solid #667eea;
+        .meta-item {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
         }
         
-        .meta-label {
-            font-size: 12px;
+        .meta-item .label {
+            font-size: 11px;
             text-transform: uppercase;
-            letter-spacing: 1px;
-            color: #95A5A6;
-            margin-bottom: 8px;
+            letter-spacing: 0.5px;
+            opacity: 0.8;
+            font-weight: 500;
         }
         
-        .meta-value {
-            font-size: 20px;
+        .meta-item .value {
+            font-size: 15px;
             font-weight: 600;
+        }
+        
+        .toc {
+            background: #F8F9FA;
+            padding: 30px 50px;
+            border-bottom: 1px solid #E1E4E8;
+        }
+        
+        .toc h2 {
+            color: #1877F2;
+            font-size: 20px;
+            margin-bottom: 20px;
+            font-weight: 600;
+        }
+        
+        .toc-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 12px;
+        }
+        
+        .toc-item {
+            background: #FFFFFF;
+            padding: 12px 16px;
+            border-radius: 6px;
+            border-left: 3px solid #1877F2;
+            text-decoration: none;
             color: #2C3E50;
+            display: block;
+            transition: all 0.2s ease;
+            font-weight: 500;
+            font-size: 14px;
         }
         
-        .server-card {
-            background: white;
-            border-radius: 15px;
-            margin-bottom: 30px;
-            overflow: hidden;
-            box-shadow: 0 5px 20px rgba(0,0,0,0.08);
+        .toc-item:hover {
+            background: #E7F3FF;
+            transform: translateX(3px);
         }
         
-        .server-card-header {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 30px;
-            position: relative;
+        .content {
+            padding: 40px 50px;
         }
         
-        .server-name {
-            font-size: 32px;
-            font-weight: 700;
-            margin-bottom: 5px;
+        .server-section {
+            margin-bottom: 50px;
         }
         
-        .validation-type {
-            font-size: 16px;
-            opacity: 0.9;
+        .server-header {
+            background: #1877F2;
+            color: #FFFFFF;
+            padding: 20px 30px;
+            border-radius: 6px 6px 0 0;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 0;
+        }
+        
+        .server-header h2 {
+            font-size: 22px;
+            font-weight: 600;
+        }
+        
+        .server-status {
+            background: rgba(255, 255, 255, 0.2);
+            padding: 6px 14px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
         }
         
         .category-section {
-            padding: 30px;
-            border-bottom: 1px solid #ECF0F1;
+            margin-bottom: 30px;
+            background: #FFFFFF;
+            border: 1px solid #E1E4E8;
+            border-radius: 6px;
+            overflow: hidden;
         }
         
-        .category-section:last-child {
-            border-bottom: none;
+        .category-header {
+            background: #F8F9FA;
+            padding: 16px 30px;
+            border-bottom: 2px solid #1877F2;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
         }
         
-        .category-title {
-            font-size: 24px;
+        .category-header h3 {
+            color: #1877F2;
+            font-size: 18px;
             font-weight: 600;
-            color: #2C3E50;
-            margin-bottom: 20px;
-            padding-bottom: 10px;
-            border-bottom: 3px solid #667eea;
-            display: inline-block;
         }
         
-        .item-count-badge {
-            background: #667eea;
-            color: white;
-            padding: 5px 15px;
-            border-radius: 20px;
-            font-size: 14px;
+        .item-count {
+            background: #1877F2;
+            color: #FFFFFF;
+            padding: 4px 12px;
+            border-radius: 4px;
+            font-size: 12px;
             font-weight: 600;
-            margin-left: 15px;
+        }
+        
+        .table-container {
+            overflow-x: auto;
         }
         
         table {
             width: 100%;
-            border-collapse: separate;
-            border-spacing: 0;
-            margin-top: 15px;
+            border-collapse: collapse;
+            font-size: 13px;
         }
         
         thead {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
+            background: #2C3E50;
+            color: #FFFFFF;
         }
         
         th {
-            padding: 15px;
+            padding: 14px 16px;
             text-align: left;
             font-weight: 600;
-            font-size: 13px;
             text-transform: uppercase;
             letter-spacing: 0.5px;
-        }
-        
-        th:first-child {
-            border-top-left-radius: 10px;
-        }
-        
-        th:last-child {
-            border-top-right-radius: 10px;
+            font-size: 11px;
         }
         
         td {
-            padding: 15px;
-            border-bottom: 1px solid #ECF0F1;
-            font-size: 14px;
+            padding: 12px 16px;
+            border-bottom: 1px solid #E1E4E8;
+            color: #2C3E50;
         }
         
         tbody tr {
-            transition: all 0.3s ease;
+            transition: background-color 0.15s ease;
         }
         
         tbody tr:hover {
-            background: #F8F9FA;
-            transform: scale(1.01);
+            background-color: #F8F9FA;
+        }
+        
+        tbody tr:nth-child(even) {
+            background-color: #FAFBFC;
         }
         
         .status-success {
-            background: #D5F4E6 !important;
-            border-left: 4px solid #27AE60;
+            background-color: #D4EDDA !important;
         }
         
         .status-warning {
-            background: #FFF4E6 !important;
-            border-left: 4px solid #F39C12;
+            background-color: #FFF3CD !important;
         }
         
         .status-error {
-            background: #FADBD8 !important;
-            border-left: 4px solid #E74C3C;
+            background-color: #F8D7DA !important;
         }
         
         .status-info {
-            background: #EBF5FB !important;
-            border-left: 4px solid #3498DB;
+            background-color: #D1ECF1 !important;
         }
         
-        .status-badge {
+        .badge {
             display: inline-block;
-            padding: 6px 12px;
-            border-radius: 20px;
+            padding: 4px 10px;
+            border-radius: 4px;
             font-size: 11px;
-            font-weight: 700;
+            font-weight: 600;
             text-transform: uppercase;
-            letter-spacing: 0.5px;
+            letter-spacing: 0.3px;
         }
         
         .badge-success {
-            background: #27AE60;
-            color: white;
+            background: #28A745;
+            color: #FFFFFF;
         }
         
         .badge-warning {
-            background: #F39C12;
-            color: white;
+            background: #FFC107;
+            color: #212529;
         }
         
         .badge-error {
-            background: #E74C3C;
-            color: white;
+            background: #DC3545;
+            color: #FFFFFF;
         }
         
         .badge-info {
-            background: #3498DB;
-            color: white;
+            background: #17A2B8;
+            color: #FFFFFF;
         }
         
-        .report-footer {
-            background: white;
-            border-radius: 15px;
-            padding: 40px;
-            margin-top: 30px;
+        .footer {
+            background: #F8F9FA;
+            padding: 30px 50px;
             text-align: center;
-            box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+            border-top: 1px solid #E1E4E8;
         }
         
-        .footer-title {
-            font-size: 24px;
-            font-weight: 700;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            margin-bottom: 15px;
+        .footer-content {
+            max-width: 800px;
+            margin: 0 auto;
         }
         
-        .footer-text {
-            color: #7F8C8D;
-            font-size: 14px;
-            line-height: 1.8;
+        .footer h3 {
+            color: #1877F2;
+            font-size: 18px;
+            margin-bottom: 12px;
+            font-weight: 600;
+        }
+        
+        .footer p {
+            color: #6C757D;
+            font-size: 13px;
+            line-height: 1.7;
+        }
+        
+        .footer-logo {
+            margin-top: 20px;
+            padding-top: 20px;
+            border-top: 1px solid #E1E4E8;
+            color: #6C757D;
+            font-size: 12px;
         }
         
         @media print {
             body {
-                background: white;
+                background: #FFFFFF;
                 padding: 0;
             }
             
-            .server-card {
+            .container {
+                box-shadow: none;
+            }
+            
+            .toc {
+                display: none;
+            }
+            
+            .server-section {
                 page-break-inside: avoid;
             }
         }
     </style>
 </head>
 <body>
-    <div class="page-wrapper">
-        <div class="report-header">
-            <h1 class="report-title">Infrastructure Validation Report</h1>
-            <p class="report-subtitle">Comprehensive System Health Assessment & Professional Documentation</p>
-            
-            <div class="meta-grid">
-                <div class="meta-card">
-                    <div class="meta-label">Report Date</div>
-                    <div class="meta-value">REPORT_DATE</div>
-                </div>
-                <div class="meta-card">
-                    <div class="meta-label">Report Time</div>
-                    <div class="meta-value">REPORT_TIME</div>
-                </div>
-                <div class="meta-card">
-                    <div class="meta-label">Total Servers</div>
-                    <div class="meta-value">TOTAL_SERVERS</div>
-                </div>
-                <div class="meta-card">
-                    <div class="meta-label">Validation Type</div>
-                    <div class="meta-value">VALIDATION_TYPE_PLACEHOLDER</div>
-                </div>
-                <div class="meta-card">
-                    <div class="meta-label">Generated By</div>
-                    <div class="meta-value">Hisham Nasur</div>
+    <div class="container">
+        <div class="header">
+            <div class="header-content">
+                <h1>Infrastructure Validation Report</h1>
+                <div class="subtitle">Comprehensive System Health Assessment &amp; Documentation</div>
+                
+                <div class="meta-info">
+                    <div class="meta-item">
+                        <div class="label">Generated Date</div>
+                        <div class="value">REPORT_DATE</div>
+                    </div>
+                    <div class="meta-item">
+                        <div class="label">Generated Time</div>
+                        <div class="value">REPORT_TIME</div>
+                    </div>
+                    <div class="meta-item">
+                        <div class="label">Total Servers</div>
+                        <div class="value">TOTAL_SERVERS</div>
+                    </div>
+                    <div class="meta-item">
+                        <div class="label">Created By</div>
+                        <div class="value">Hisham Nasur - NN - MS Operation</div>
+                    </div>
                 </div>
             </div>
         </div>
         
-        <div class="servers-container">
+        <div class="toc">
+            <h2>Table of Contents</h2>
+            <div class="toc-grid">
+TOC_CONTENT
+            </div>
+        </div>
+        
+        <div class="content">
 SERVER_CONTENT
         </div>
         
-        <div class="report-footer">
-            <h3 class="footer-title">Infrastructure Validation Tool</h3>
-            <p class="footer-text">
-                This professional report was automatically generated by Infrastructure Validation Tool v1.0<br>
-                Created by: Hisham Nasur - NN - MS Operation<br>
-                © 2025 All Rights Reserved
-            </p>
+        <div class="footer">
+            <div class="footer-content">
+                <h3>Infrastructure Validation Tool</h3>
+                <p>
+                    This report was automatically generated by the Infrastructure Validation Tool v1.0<br>
+                    Professional infrastructure health assessment and documentation system
+                </p>
+                <div class="footer-logo">
+                    <strong>2025 Hisham Nasur - NN - MS Operation</strong><br>
+                    Infrastructure Handover Validation Tool | Version 1.0
+                </div>
+            </div>
         </div>
     </div>
 </body>
 </html>
 '@
 
-
     # Replace placeholders
     $HTML = $HTML -replace 'REPORT_DATE', (Get-Date -Format 'MMMM dd, yyyy')
     $HTML = $HTML -replace 'REPORT_TIME', (Get-Date -Format 'HH:mm:ss')
     $HTML = $HTML -replace 'TOTAL_SERVERS', $Results.Keys.Count
     
-    # Extract validation types from results
-    $ValidationTypes = @()
-    foreach ($ServerName in $Results.Keys) {
-        $ServerData = $Results[$ServerName]
-        if ($ServerData -and $ServerData.Type) {
-            $ValidationTypes += $ServerData.Type
-        }
-    }
-
-    # Remove duplicates and join with comma
-    $ValidationTypes = ($ValidationTypes | Select-Object -Unique) -join ', '
-
-    # If no validation type found, use default
-    if ([string]::IsNullOrEmpty($ValidationTypes)) {
-        $ValidationTypes = "Infrastructure Validation"
-    }
-
-    # Replace placeholder in HTML
-    $HTML = $HTML -replace 'VALIDATION_TYPE_PLACEHOLDER', $ValidationTypes
-
     # Generate TOC
     $TOCContent = ""
     foreach ($ServerName in $Results.Keys | Sort-Object) {
@@ -7212,120 +6909,126 @@ SERVER_CONTENT
     }
     $HTML = $HTML -replace 'TOC_CONTENT', $TOCContent
     
-    # Generate Server Content with new card-based design
-$ServerContent = ""
-foreach ($ServerName in $Results.Keys | Sort-Object) {
-    $ServerData = $Results[$ServerName]
-    $Data = $ServerData.Results
-    $ValidationType = $ServerData.Type
-    
-    $ServerContent += @"
-        <div class="server-card">
-            <div class="server-card-header">
-                <h2 class="server-name">$ServerName</h2>
-                <div class="validation-type">$ValidationType Validation</div>
-            </div>
+    # Generate Server Content
+    $ServerContent = ""
+    foreach ($ServerName in $Results.Keys | Sort-Object) {
+        $ServerData = $Results[$ServerName]
+        $Data = $ServerData.Results
+        $ServerID = $ServerName -replace '[^a-zA-Z0-9]', '-'
+        
+        $ServerContent += @"
+            <div class="server-section" id="server-$ServerID">
+                <div class="server-header">
+                    <h2>$ServerName</h2>
+                    <span class="server-status">Active</span>
+                </div>
 
 "@
 
-    foreach ($Category in $Data.Keys | Sort-Object) {
-        if ($Data[$Category].Count -gt 0) {
-            $ItemCount = $Data[$Category].Count
-            
-            $ServerContent += @"
-            <div class="category-section">
-                <h3 class="category-title">$Category<span class="item-count-badge">$ItemCount Items</span></h3>
-                <table>
-                    <thead>
-                        <tr>
+        foreach ($Category in $Data.Keys | Sort-Object) {
+            if ($Data[$Category].Count -gt 0) {
+                $ItemCount = $Data[$Category].Count
+                
+                $ServerContent += @"
+                <div class="category-section">
+                    <div class="category-header">
+                        <h3>$Category</h3>
+                        <span class="item-count">$ItemCount Items</span>
+                    </div>
+                    <div class="table-container">
+                        <table>
+                            <thead>
+                                <tr>
 
 "@
 
-            $FirstItem = $Data[$Category][0]
-            $Properties = $FirstItem.PSObject.Properties.Name
-            
-            foreach ($Prop in $Properties) {
-                $ServerContent += "                            <th>$Prop</th>`r`n"
-            }
-            
-            $ServerContent += @"
-                        </tr>
-                    </thead>
-                    <tbody>
-
-"@
-
-            foreach ($Item in $Data[$Category]) {
-                $RowClass = ""
-                $StatusValue = ""
-                
-                # Determine status
-                if ($Item.PSObject.Properties.Name -contains "Status") {
-                    $StatusValue = $Item.Status
-                }
-                elseif ($Item.PSObject.Properties.Name -contains "Result") {
-                    $StatusValue = $Item.Result
-                }
-                elseif ($Item.PSObject.Properties.Name -contains "StatusCode") {
-                    $StatusValue = $Item.StatusCode
-                }
-                
-                if ($StatusValue -match "OK|Normal|Valid|Running|Success|Enabled") {
-                    $RowClass = " class='status-success'"
-                }
-                elseif ($StatusValue -match "Warning|Check|Expiring") {
-                    $RowClass = " class='status-warning'"
-                }
-                elseif ($StatusValue -match "Error|Failed|Critical|EXPIRED|SECURITY|RISK") {
-                    $RowClass = " class='status-error'"
-                }
-                elseif ($StatusValue -match "Info") {
-                    $RowClass = " class='status-info'"
-                }
-                
-                $ServerContent += "                        <tr$RowClass>`r`n"
+                $FirstItem = $Data[$Category][0]
+                $Properties = $FirstItem.PSObject.Properties.Name
                 
                 foreach ($Prop in $Properties) {
-                    $CellValue = Sanitize-HTMLContent -Content $Item.$Prop
-                    
-                    if ($Prop -match "Status|Result|StatusCode" -and $CellValue) {
-                        $BadgeClass = "badge-info"
-                        if ($CellValue -match "OK|Normal|Valid|Running|Success") {
-                            $BadgeClass = "badge-success"
-                        }
-                        elseif ($CellValue -match "Warning|Check|Expiring") {
-                            $BadgeClass = "badge-warning"
-                        }
-                        elseif ($CellValue -match "Error|Failed|Critical|EXPIRED|SECURITY|RISK") {
-                            $BadgeClass = "badge-error"
-                        }
-                        
-                        $ServerContent += "                            <td><span class='status-badge $BadgeClass'>$CellValue</span></td>`r`n"
-                    }
-                    else {
-                        $ServerContent += "                            <td>$CellValue</td>`r`n"
-                    }
+                    $ServerContent += "                                    <th>$Prop</th>`r`n"
                 }
                 
-                $ServerContent += "                        </tr>`r`n"
-            }
-            
-            $ServerContent += @"
-                    </tbody>
-                </table>
-            </div>
+                $ServerContent += @"
+                                </tr>
+                            </thead>
+                            <tbody>
 
 "@
+
+                foreach ($Item in $Data[$Category]) {
+                    $RowClass = ""
+                    $StatusValue = ""
+                    
+                    if ($Item.PSObject.Properties.Name -contains "Status") {
+                        $StatusValue = $Item.Status
+                    }
+                    elseif ($Item.PSObject.Properties.Name -contains "Result") {
+                        $StatusValue = $Item.Result
+                    }
+                    elseif ($Item.PSObject.Properties.Name -contains "StatusCode") {
+                        $StatusValue = $Item.StatusCode
+                    }
+                    
+                    if ($StatusValue -match "OK|Normal|Valid|Running|Success|Enabled|Active|Configured|Listening") {
+                        $RowClass = " class='status-success'"
+                    }
+                    elseif ($StatusValue -match "Warning|Check|Expiring|Not Configured") {
+                        $RowClass = " class='status-warning'"
+                    }
+                    elseif ($StatusValue -match "Error|Failed|Critical|EXPIRED|SECURITY|RISK|Not Running|Missing") {
+                        $RowClass = " class='status-error'"
+                    }
+                    elseif ($StatusValue -match "Info") {
+                        $RowClass = " class='status-info'"
+                    }
+                    
+                    $ServerContent += "                                <tr$RowClass>`r`n"
+                    
+                    foreach ($Prop in $Properties) {
+                        $CellValue = Sanitize-HTMLContent -Content $Item.$Prop
+                        
+                        if ($Prop -match "Status|Result|StatusCode" -and $CellValue) {
+                            $BadgeClass = "badge-info"
+                            if ($CellValue -match "OK|Normal|Valid|Running|Success|Enabled|Active|Configured|Listening") {
+                                $BadgeClass = "badge-success"
+                            }
+                            elseif ($CellValue -match "Warning|Check|Expiring") {
+                                $BadgeClass = "badge-warning"
+                            }
+                            elseif ($CellValue -match "Error|Failed|Critical|EXPIRED|SECURITY|RISK") {
+                                $BadgeClass = "badge-error"
+                            }
+                            
+                            $ServerContent += "                                    <td><span class='badge $BadgeClass'>$CellValue</span></td>`r`n"
+                        }
+                        else {
+                            $ServerContent += "                                    <td>$CellValue</td>`r`n"
+                        }
+                    }
+                    
+                    $ServerContent += "                                </tr>`r`n"
+                }
+                
+                $ServerContent += @"
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+"@
+            }
         }
+        
+        $ServerContent += "            </div>`r`n"
     }
     
-    $ServerContent += "        </div>`r`n`r`n"
+    $HTML = $HTML -replace 'SERVER_CONTENT', $ServerContent
+    
+    return $HTML
 }
 
-$HTML = $HTML -replace 'SERVER_CONTENT', $ServerContent
-
-return $HTML
-}
+#endregion
 
 #endregion
 
@@ -7380,21 +7083,6 @@ function Show-ValidationGUI {
     $Global:MainForm.Add_FormClosing({
         param($sender, $e)
         
-        # Check if validation is running
-        if ($Global:ValidationInProgress) {
-            $Result = [System.Windows.Forms.MessageBox]::Show(
-                "A validation is currently running.`n`nAre you sure you want to close and cancel the validation?",
-                "Validation In Progress",
-                "YesNo",
-                "Warning"
-            )
-            
-            if ($Result -eq "No") {
-                $e.Cancel = $true
-                return
-            }
-        }
-        
         # Clear credentials
         if ($Script:Credential) {
             Write-AuditLog -Action "Disconnect" -Target $Script:Credential.UserName -Result "AutoCleanup"
@@ -7407,15 +7095,6 @@ function Show-ValidationGUI {
                 Disconnect-ExchangeRemote -ServerName $ServerName
             } catch {}
         }
-        
-        # NEW: Release mutex before exit
-        try {
-            if ($Script:ValidationMutex) {
-                $Script:ValidationMutex.ReleaseMutex()
-                $Script:ValidationMutex.Dispose()
-            }
-        }
-        catch {}
         
         # Force memory cleanup
         [System.GC]::Collect()
