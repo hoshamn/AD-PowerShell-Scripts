@@ -6206,7 +6206,7 @@ function Export-ValidationCSV {
             }
             
             $CSVData += [PSCustomObject]@{
-                'Category' = 'Author: Hisham Nasur - NN - MS Operation'
+                'Category' = 'Author: Nournet - MS Operation'
                 'Item' = ''
                 'Details' = ''
                 'Status' = ''
@@ -6861,7 +6861,7 @@ function Generate-HTMLReport {
                     </div>
                     <div class="meta-item">
                         <div class="label">Created By</div>
-                        <div class="value">Hisham Nasur - NN - MS Operation</div>
+                        <div class="value">Nournet - MS Operation</div>
                     </div>
                 </div>
             </div>
@@ -6886,7 +6886,7 @@ SERVER_CONTENT
                     Professional infrastructure health assessment and documentation system
                 </p>
                 <div class="footer-logo">
-                    <strong>2025 Hisham Nasur - NN - MS Operation</strong><br>
+                    <strong>2025 Nournet - MS Operation</strong><br>
                     Infrastructure Handover Validation Tool | Version 1.0
                 </div>
             </div>
@@ -7431,7 +7431,7 @@ function Show-ValidationGUI {
     $HeaderPanel.Controls.Add($TitleLabel)
     
     $VersionLabel = New-Object System.Windows.Forms.Label
-    $VersionLabel.Text = "Version 1.0  |  Created by: Hisham Nasur - NN - MS Operation"
+    $VersionLabel.Text = "Version 1.0  |  Created by: Nournet - MS Operation"
     $VersionLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10)
     $VersionLabel.ForeColor = [System.Drawing.Color]::FromArgb(189, 195, 199)
     $VersionLabel.Location = New-Object System.Drawing.Point(35, 60)
