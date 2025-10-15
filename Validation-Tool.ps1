@@ -44,7 +44,7 @@ $Script:Thresholds = @{
     CertificateExpiryWarningDays = 30
     AuthLockoutMinutes = 5
     MaxAuthAttempts = 3
-    RemoteCommandTimeoutSeconds = 300
+    RemoteCommandTimeoutSeconds = 60
 }
 
 $Script:Colors = @{
@@ -113,6 +113,26 @@ function Write-AuditLog {
     $LogPath = ".\Logs"
     if (-not (Test-Path $LogPath)) {
         New-Item -Path $LogPath -ItemType Directory -Force | Out-Null
+        
+        # NEW: Set restrictive permissions on log folder
+        try {
+            $Acl = Get-Acl $LogPath
+            $Acl.SetAccessRuleProtection($true, $false)
+            
+            # Allow only Administrators full control
+            $AdminRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                "BUILTIN\Administrators", 
+                "FullControl", 
+                "ContainerInherit,ObjectInherit", 
+                "None", 
+                "Allow"
+            )
+            $Acl.AddAccessRule($AdminRule)
+            Set-Acl -Path $LogPath -AclObject $Acl
+        }
+        catch {
+            Write-Warning "Could not set restrictive permissions on log folder"
+        }
     }
     
     $LogFile = Join-Path $LogPath "ValidationAudit-$(Get-Date -Format 'yyyyMM').log"
@@ -213,6 +233,16 @@ function Disconnect-Credentials {
         )
         
         if ($Result -eq "Yes") {
+            # NEW: Secure credential disposal
+            try {
+                if ($Script:Credential.Password) {
+                    $Script:Credential.Password.Dispose()
+                }
+            }
+            catch {
+                Write-Warning "Could not dispose credential securely"
+            }
+            
             $Script:Credential = $null
             $Script:ConnectionStatus.Clear()
             
@@ -221,6 +251,11 @@ function Disconnect-Credentials {
             foreach ($ServerName in $SessionKeys) {
                 Disconnect-ExchangeRemote -ServerName $ServerName
             }
+            
+            # NEW: Force memory cleanup
+            [System.GC]::Collect()
+            [System.GC]::WaitForPendingFinalizers()
+            [System.GC]::Collect()
             
             Update-CredentialDisplay
             Update-Status "Disconnected - No credentials loaded"
@@ -1036,37 +1071,12 @@ function Test-ServerConnection {
     }
 }
 
-<#
-function Invoke-SafeRemoteCommand {
-    param(
-        [string]$ServerName,
-        [scriptblock]$ScriptBlock,
-        [System.Management.Automation.PSCredential]$Credential
-    )
-    $ConnectionInfo = $Script:ConnectionStatus[$ServerName]
-    if (-not $ConnectionInfo -or $ConnectionInfo.Status -ne 'Connected') {
-        return @{ Success = $false; Data = $null; Error = "Not connected" }
-    }
-    try {
-        # ALWAYS use credentials when provided - never fall back to current session
-        if ($Credential) {
-            $Result = Invoke-Command -ComputerName $ServerName -ScriptBlock $ScriptBlock -Credential $Credential -ErrorAction Stop
-        } else {
-            return @{ Success = $false; Data = $null; Error = "No credentials provided" }
-        }
-        return @{ Success = $true; Data = $Result; Error = $null }
-    }
-    catch {
-        return @{ Success = $false; Data = $null; Error = $_.Exception.Message }
-    }
-}
-#>
 function Invoke-SafeRemoteCommand {
     param(
         [string]$ServerName,
         [scriptblock]$ScriptBlock,
         [System.Management.Automation.PSCredential]$Credential,
-        [int]$TimeoutSeconds = 300
+        [int]$TimeoutSeconds = 60
     )
     
     if (-not $Credential) {
@@ -1131,11 +1141,30 @@ function Connect-ExchangeRemote {
 
 function Disconnect-ExchangeRemote {
     param([string]$ServerName)
+    
     if ($Script:ExchangeSessions.ContainsKey($ServerName)) {
+        $Session = $Script:ExchangeSessions[$ServerName]
         try {
-            Remove-PSSession -Session $Script:ExchangeSessions[$ServerName] -ErrorAction SilentlyContinue
+            # Check if session exists and is open
+            if ($Session -and $Session.State -eq 'Opened') {
+                Remove-PSSession -Session $Session -ErrorAction Stop
+            }
+        }
+        catch {
+            Write-Warning "Failed to close Exchange session for $ServerName : $($_.Exception.Message)"
+        }
+        finally {
+            # Always remove from tracking and dispose
             $Script:ExchangeSessions.Remove($ServerName)
-        } catch {}
+            if ($Session) {
+                try {
+                    $Session.Dispose()
+                }
+                catch {
+                    # Ignore disposal errors
+                }
+            }
+        }
     }
 }
 
@@ -1361,6 +1390,7 @@ function Get-ServerDetails {
             $FreeGB = [math]::Round($Disk.FreeSpace / 1GB, 2)
             $UsedGB = $TotalGB - $FreeGB
             $UsagePercent = if ($TotalGB -gt 0) { [math]::Round(($UsedGB / $TotalGB) * 100, 2) } else { 0 }
+            $Status = if ($UsagePercent -ge 95) { "Critical" } elseif ($UsagePercent -ge 85) { "Warning"} else { "Normal"}
             $ServerDetails.Disks += [PSCustomObject]@{
                 Drive = $Disk.DeviceID
                 Label = if ($Disk.VolumeName) { $Disk.VolumeName } else { "No Label" }
@@ -1369,7 +1399,7 @@ function Get-ServerDetails {
                 UsedSpace = "$UsedGB GB"
                 FreeSpace = "$FreeGB GB"
                 UsagePercent = "$UsagePercent%"
-                Status = if ($UsagePercent -lt $Script:Thresholds.DiskWarningPercent) { "Normal" } elseif ($UsagePercent -lt $Script:Thresholds.DiskCriticalPercent) { "Warning" } else { "Critical" }
+                Status = $Status
             }
         }
         $ServiceList = @(
@@ -1917,15 +1947,7 @@ function Test-ExchangeComprehensive {
                 Status = "Failed"
             }
         }
-            # If certificate query fails, add error entry
-            $Results.Certificates += [PSCustomObject]@{
-                Subject = "Error retrieving certificates"
-                Thumbprint = $_.Exception.Message
-                NotAfter = ""
-                DaysToExpire = 0
-                Services = "N/A"
-                Status = "Failed"
-            }
+            
         try {
             $Connectors = Get-SendConnector -ErrorAction SilentlyContinue
             foreach ($Conn in $Connectors) {
@@ -2139,18 +2161,154 @@ function Test-ExchangeComprehensive {
                 }
             }
         } catch {}
+        # 15. Verify No Internet Access
         try {
-            $InternetTest = Test-Connection -ComputerName "8.8.8.8" -Count 1 -Quiet -ErrorAction SilentlyContinue
-            $Results.InternetAccess += [PSCustomObject]@{
-                Check = "Internet Connectivity"
-                Result = if ($InternetTest) { "HAS INTERNET ACCESS" } else { "No Internet (Compliant)" }
-                Status = if ($InternetTest) { "SECURITY RISK" } else { "OK" }
+            # Test actual web browsing capability, not just ICMP ping
+            $InternetTests = @()
+            
+            # Test 1: HTTP/HTTPS to multiple reliable endpoints
+            $TestSites = @(
+                @{URL="http://www.msftconnecttest.com/connecttest.txt"; Name="Microsoft"},
+                @{URL="http://detectportal.firefox.com/success.txt"; Name="Mozilla"},
+                @{URL="http://clients3.google.com/generate_204"; Name="Google"}
+            )
+            
+            $SuccessfulTests = 0
+            $FailedTests = 0
+            $TestDetails = @()
+            
+            foreach ($Site in $TestSites) {
+                try {
+                    $Response = Invoke-WebRequest -Uri $Site.URL -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
+                    if ($Response.StatusCode -eq 200 -or $Response.StatusCode -eq 204) {
+                        $SuccessfulTests++
+                        $TestDetails += "$($Site.Name): Accessible"
+                    }
+                    else {
+                        $FailedTests++
+                        $TestDetails += "$($Site.Name): HTTP $($Response.StatusCode)"
+                    }
+                }
+                catch {
+                    $FailedTests++
+                    $TestDetails += "$($Site.Name): Blocked/Failed"
+                }
             }
-        } catch {
+            
+            # Determine final status
+            if ($SuccessfulTests -eq 0) {
+                # No internet access - COMPLIANT (as expected for secure infrastructure)
+                $Results.InternetAccess += [PSCustomObject]@{
+                    Check = "Web Browsing Test"
+                    Result = "No Internet Access (Compliant)"
+                    Details = "All HTTP/HTTPS requests blocked"
+                    Status = "OK"
+                }
+            }
+            elseif ($SuccessfulTests -eq $TestSites.Count) {
+                # Full internet access - SECURITY RISK
+                $Results.InternetAccess += [PSCustomObject]@{
+                    Check = "Web Browsing Test"
+                    Result = "FULL INTERNET ACCESS DETECTED"
+                    Details = "All test sites accessible: $($TestDetails -join ' | ')"
+                    Status = "SECURITY RISK"
+                }
+            }
+            else {
+                # Partial internet access - WARNING
+                $Results.InternetAccess += [PSCustomObject]@{
+                    Check = "Web Browsing Test"
+                    Result = "Partial Internet Access"
+                    Details = "$SuccessfulTests of $($TestSites.Count) sites accessible: $($TestDetails -join ' | ')"
+                    Status = "WARNING"
+                }
+            }
+            
+            # Test 2: DNS Resolution (can resolve but not browse?)
+            try {
+                $DNSTest = Resolve-DnsName -Name "www.microsoft.com" -Type A -ErrorAction Stop
+                $DNSWorks = $true
+            }
+            catch {
+                $DNSWorks = $false
+            }
+            
             $Results.InternetAccess += [PSCustomObject]@{
-                Check = "Internet Connectivity"
-                Result = "No Internet (Compliant)"
-                Status = "OK"
+                Check = "DNS Resolution"
+                Result = if ($DNSWorks) { "DNS Working" } else { "DNS Blocked/Failed" }
+                Details = if ($DNSWorks) { "Can resolve external domains" } else { "Cannot resolve external domains" }
+                Status = if ($DNSWorks -and $SuccessfulTests -eq 0) { "INFO" } elseif ($DNSWorks) { "OK" } else { "OK" }
+            }
+            
+            # Test 3: Proxy Detection
+            try {
+                $ProxySettings = Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" -ErrorAction SilentlyContinue
+                $ProxyEnabled = $ProxySettings.ProxyEnable -eq 1
+                $ProxyServer = $ProxySettings.ProxyServer
+                
+                if ($ProxyEnabled) {
+                    $Results.InternetAccess += [PSCustomObject]@{
+                        Check = "Proxy Configuration"
+                        Result = "Proxy Configured"
+                        Details = "Proxy Server: $ProxyServer"
+                        Status = "INFO"
+                    }
+                }
+                else {
+                    $Results.InternetAccess += [PSCustomObject]@{
+                        Check = "Proxy Configuration"
+                        Result = "No Proxy Configured"
+                        Details = "Direct connection settings"
+                        Status = "INFO"
+                    }
+                }
+            }
+            catch {
+                $Results.InternetAccess += [PSCustomObject]@{
+                    Check = "Proxy Configuration"
+                    Result = "Unable to check"
+                    Details = "Registry access failed"
+                    Status = "INFO"
+                }
+            }
+            
+            # Test 4: Windows Firewall Status
+            try {
+                $FirewallProfiles = Get-NetFirewallProfile -ErrorAction SilentlyContinue
+                $EnabledProfiles = ($FirewallProfiles | Where-Object { $_.Enabled -eq $true }).Name -join ", "
+                
+                if ($EnabledProfiles) {
+                    $Results.InternetAccess += [PSCustomObject]@{
+                        Check = "Windows Firewall"
+                        Result = "Enabled"
+                        Details = "Active Profiles: $EnabledProfiles"
+                        Status = "OK"
+                    }
+                }
+                else {
+                    $Results.InternetAccess += [PSCustomObject]@{
+                        Check = "Windows Firewall"
+                        Result = "Disabled"
+                        Details = "No firewall profiles active"
+                        Status = "WARNING"
+                    }
+                }
+            }
+            catch {
+                $Results.InternetAccess += [PSCustomObject]@{
+                    Check = "Windows Firewall"
+                    Result = "Unable to check"
+                    Details = $_.Exception.Message
+                    Status = "INFO"
+                }
+            }
+        }
+        catch {
+            $Results.InternetAccess += [PSCustomObject]@{
+                Check = "Internet Connectivity Test"
+                Result = "Test Failed"
+                Details = $_.Exception.Message
+                Status = "ERROR"
             }
         }
         return $Results
@@ -2934,7 +3092,7 @@ function Test-ActiveDirectoryComprehensive {
             return @{ Error = "Active Directory module not available: $($_.Exception.Message)" }
         }
         
-        # 1. Verify Replication Health - PROFESSIONAL ORGANIZED VERSION
+        # 1. Verify Replication Health - ASCII SAFE VERSION
         try {
             # Get all Domain Controllers in the domain
             $AllDCs = @()
@@ -2943,7 +3101,8 @@ function Test-ActiveDirectoryComprehensive {
             }
             catch {
                 $Results.Replication += [PSCustomObject]@{
-                    Partner = "ERROR: Cannot retrieve Domain Controllers"
+                    DCName = "ERROR"
+                    Partner = "Cannot retrieve Domain Controllers"
                     Partition = $_.Exception.Message
                     LastSuccess = ""
                     MinutesAgo = ""
@@ -2953,41 +3112,9 @@ function Test-ActiveDirectoryComprehensive {
             }
             
             if ($AllDCs.Count -gt 0) {
-                # SECTION 1: Domain Controller Inventory
+                # SECTION 1: Domain Controller Inventory Header
                 $Results.Replication += [PSCustomObject]@{
-                    Partner = "=========================================="
-                    Partition = "DOMAIN CONTROLLER INVENTORY"
-                    LastSuccess = ""
-                    MinutesAgo = ""
-                    ConsecutiveFailures = ""
-                    Status = "INFO"
-                }
-                
-                $Results.Replication += [PSCustomObject]@{
-                    Partner = "=========================================="
-                    Partition = ""
-                    LastSuccess = ""
-                    MinutesAgo = ""
-                    ConsecutiveFailures = ""
-                    Status = ""
-                }
-                
-                foreach ($DC in $AllDCs) {
-                    $IsCurrentDC = ($DC.HostName -eq $env:COMPUTERNAME) -or ($DC.Name -eq $env:COMPUTERNAME)
-                    $DCLabel = if ($IsCurrentDC) { ">>> CURRENT SERVER <<<" } else { "Remote DC" }
-                    
-                    $Results.Replication += [PSCustomObject]@{
-                        Partner = $DC.Name
-                        Partition = "Site: $($DC.Site)"
-                        LastSuccess = "IP: $($DC.IPv4Address)"
-                        MinutesAgo = $DC.OperatingSystem
-                        ConsecutiveFailures = ""
-                        Status = $DCLabel
-                    }
-                }
-                
-                # Blank separator
-                $Results.Replication += [PSCustomObject]@{
+                    DCName = "================================================================================"
                     Partner = ""
                     Partition = ""
                     LastSuccess = ""
@@ -2996,10 +3123,10 @@ function Test-ActiveDirectoryComprehensive {
                     Status = ""
                 }
                 
-                # SECTION 2: Replication Status for All DCs
                 $Results.Replication += [PSCustomObject]@{
-                    Partner = "=========================================="
-                    Partition = "REPLICATION STATUS FOR ALL DCs"
+                    DCName = "DOMAIN CONTROLLER INVENTORY"
+                    Partner = "$($AllDCs.Count) Domain Controllers Found"
+                    Partition = ""
                     LastSuccess = ""
                     MinutesAgo = ""
                     ConsecutiveFailures = ""
@@ -3007,7 +3134,76 @@ function Test-ActiveDirectoryComprehensive {
                 }
                 
                 $Results.Replication += [PSCustomObject]@{
-                    Partner = "=========================================="
+                    DCName = "================================================================================"
+                    Partner = ""
+                    Partition = ""
+                    LastSuccess = ""
+                    MinutesAgo = ""
+                    ConsecutiveFailures = ""
+                    Status = ""
+                }
+                
+                # List all DCs
+                foreach ($DC in $AllDCs) {
+                    $IsCurrentDC = ($DC.HostName -eq $env:COMPUTERNAME) -or ($DC.Name -eq $env:COMPUTERNAME)
+                    $DCIndicator = if ($IsCurrentDC) { "*" } else { " " }
+                    
+                    $Results.Replication += [PSCustomObject]@{
+                        DCName = "$DCIndicator $($DC.Name)"
+                        Partner = "Site: $($DC.Site)"
+                        Partition = "IP: $($DC.IPv4Address)"
+                        LastSuccess = $DC.OperatingSystem
+                        MinutesAgo = if ($IsCurrentDC) { "CURRENT SERVER" } else { "" }
+                        ConsecutiveFailures = ""
+                        Status = "INVENTORY"
+                    }
+                }
+                
+                # Blank separator
+                $Results.Replication += [PSCustomObject]@{
+                    DCName = ""
+                    Partner = ""
+                    Partition = ""
+                    LastSuccess = ""
+                    MinutesAgo = ""
+                    ConsecutiveFailures = ""
+                    Status = ""
+                }
+                
+                # SECTION 2: Replication Status for Each DC
+                $Results.Replication += [PSCustomObject]@{
+                    DCName = "================================================================================"
+                    Partner = ""
+                    Partition = ""
+                    LastSuccess = ""
+                    MinutesAgo = ""
+                    ConsecutiveFailures = ""
+                    Status = ""
+                }
+                
+                $Results.Replication += [PSCustomObject]@{
+                    DCName = "REPLICATION STATUS - DETAILED VIEW"
+                    Partner = "Checking all replication partnerships"
+                    Partition = ""
+                    LastSuccess = ""
+                    MinutesAgo = ""
+                    ConsecutiveFailures = ""
+                    Status = "INFO"
+                }
+                
+                $Results.Replication += [PSCustomObject]@{
+                    DCName = "================================================================================"
+                    Partner = ""
+                    Partition = ""
+                    LastSuccess = ""
+                    MinutesAgo = ""
+                    ConsecutiveFailures = ""
+                    Status = ""
+                }
+                
+                $Results.Replication += [PSCustomObject]@{
+                    DCName = ""
+                    Partner = ""
                     Partition = ""
                     LastSuccess = ""
                     MinutesAgo = ""
@@ -3018,14 +3214,15 @@ function Test-ActiveDirectoryComprehensive {
                 # Check replication for each DC
                 foreach ($DC in $AllDCs) {
                     try {
-                        # DC Header
+                        # DC Section Header
                         $Results.Replication += [PSCustomObject]@{
-                            Partner = "--- $($DC.Name) ---"
-                            Partition = "Replication Partners Below"
+                            DCName = "[=== $($DC.Name) ===]"
+                            Partner = "Domain Controller"
+                            Partition = "Site: $($DC.Site)"
                             LastSuccess = ""
                             MinutesAgo = ""
                             ConsecutiveFailures = ""
-                            Status = "HEADER"
+                            Status = "DC_HEADER"
                         }
                         
                         # Get replication partners for this DC
@@ -3035,17 +3232,42 @@ function Test-ActiveDirectoryComprehensive {
                         }
                         catch {
                             $Results.Replication += [PSCustomObject]@{
-                                Partner = "    → ERROR"
-                                Partition = "Cannot query replication"
+                                DCName = "    ERROR"
+                                Partner = "Cannot query replication"
+                                Partition = ""
                                 LastSuccess = ""
                                 MinutesAgo = ""
                                 ConsecutiveFailures = ""
                                 Status = "ERROR: $($_.Exception.Message)"
                             }
+                            
+                            # Blank line after error
+                            $Results.Replication += [PSCustomObject]@{
+                                DCName = ""
+                                Partner = ""
+                                Partition = ""
+                                LastSuccess = ""
+                                MinutesAgo = ""
+                                ConsecutiveFailures = ""
+                                Status = ""
+                            }
                             continue
                         }
                         
                         if ($ReplPartners) {
+                            $PartnerCount = $ReplPartners.Count
+                            
+                            # Show partner count
+                            $Results.Replication += [PSCustomObject]@{
+                                DCName = "    Partners: $PartnerCount"
+                                Partner = ""
+                                Partition = ""
+                                LastSuccess = ""
+                                MinutesAgo = ""
+                                ConsecutiveFailures = ""
+                                Status = "INFO"
+                            }
+                            
                             foreach ($Partner in $ReplPartners) {
                                 $LastRepl = $Partner.LastReplicationSuccess
                                 $TimeSince = if ($LastRepl) { 
@@ -3066,23 +3288,24 @@ function Test-ActiveDirectoryComprehensive {
                                     $Status = "WARNING"
                                 }
                                 
-                                # Extract partner name (remove domain info)
+                                # Extract partner name (clean format)
                                 $PartnerName = $Partner.Partner
-                                if ($PartnerName -match '([^,]+)') {
-                                    $PartnerName = $Matches[1] -replace 'CN=', ''
+                                if ($PartnerName -match 'CN=([^,]+)') {
+                                    $PartnerName = $Matches[1]
                                 }
                                 
-                                # Extract partition name
+                                # Extract partition name (clean format)
                                 $PartitionName = $Partner.Partition
                                 if ($PartitionName -match 'DC=([^,]+)') {
                                     $PartitionName = $Matches[1]
                                 }
                                 
                                 $Results.Replication += [PSCustomObject]@{
-                                    Partner = "    → $PartnerName"
+                                    DCName = "    -> $PartnerName"
+                                    Partner = $PartnerName
                                     Partition = $PartitionName
                                     LastSuccess = if ($LastRepl) { $LastRepl.ToString("yyyy-MM-dd HH:mm:ss") } else { "Never" }
-                                    MinutesAgo = $TimeSince
+                                    MinutesAgo = "$TimeSince min"
                                     ConsecutiveFailures = $Partner.ConsecutiveReplicationFailures
                                     Status = $Status
                                 }
@@ -3090,7 +3313,8 @@ function Test-ActiveDirectoryComprehensive {
                         }
                         else {
                             $Results.Replication += [PSCustomObject]@{
-                                Partner = "    → No partners found"
+                                DCName = "    No replication partners"
+                                Partner = ""
                                 Partition = ""
                                 LastSuccess = ""
                                 MinutesAgo = ""
@@ -3101,6 +3325,7 @@ function Test-ActiveDirectoryComprehensive {
                         
                         # Blank line between DCs
                         $Results.Replication += [PSCustomObject]@{
+                            DCName = ""
                             Partner = ""
                             Partition = ""
                             LastSuccess = ""
@@ -3111,8 +3336,9 @@ function Test-ActiveDirectoryComprehensive {
                     }
                     catch {
                         $Results.Replication += [PSCustomObject]@{
-                            Partner = "--- $($DC.Name) ---"
-                            Partition = "ERROR"
+                            DCName = "[=== $($DC.Name) ===]"
+                            Partner = "ERROR"
+                            Partition = ""
                             LastSuccess = ""
                             MinutesAgo = ""
                             ConsecutiveFailures = ""
@@ -3121,6 +3347,7 @@ function Test-ActiveDirectoryComprehensive {
                         
                         # Blank line
                         $Results.Replication += [PSCustomObject]@{
+                            DCName = ""
                             Partner = ""
                             Partition = ""
                             LastSuccess = ""
@@ -3130,12 +3357,44 @@ function Test-ActiveDirectoryComprehensive {
                         }
                     }
                 }
+                
+                # FINAL SUMMARY
+                $Results.Replication += [PSCustomObject]@{
+                    DCName = "================================================================================"
+                    Partner = ""
+                    Partition = ""
+                    LastSuccess = ""
+                    MinutesAgo = ""
+                    ConsecutiveFailures = ""
+                    Status = ""
+                }
+                
+                $Results.Replication += [PSCustomObject]@{
+                    DCName = "REPLICATION CHECK COMPLETE"
+                    Partner = "Checked: $($AllDCs.Count) Domain Controllers"
+                    Partition = ""
+                    LastSuccess = ""
+                    MinutesAgo = ""
+                    ConsecutiveFailures = ""
+                    Status = "COMPLETE"
+                }
+                
+                $Results.Replication += [PSCustomObject]@{
+                    DCName = "================================================================================"
+                    Partner = ""
+                    Partition = ""
+                    LastSuccess = ""
+                    MinutesAgo = ""
+                    ConsecutiveFailures = ""
+                    Status = ""
+                }
             }
         }
         catch {
             $Results.Replication += [PSCustomObject]@{
-                Partner = "CRITICAL ERROR"
-                Partition = $_.Exception.Message
+                DCName = "CRITICAL ERROR"
+                Partner = $_.Exception.Message
+                Partition = ""
                 LastSuccess = ""
                 MinutesAgo = ""
                 ConsecutiveFailures = ""
@@ -3863,6 +4122,7 @@ function Test-ADFSComprehensive {
             MFAConfiguration = @()
             ADFSProperties = @()
             FarmInformation = @()
+            RelyingPartyTrusts = @()
         }
         
         # 1. Verify ADFS Service Running
@@ -4379,6 +4639,205 @@ function Test-ADFSComprehensive {
                 Setting = "Error"
                 Value = $_.Exception.Message
                 Type = ""
+                Status = "Failed"
+            }
+        }
+        
+        # 7. Verify Relying Party Trusts
+        try {
+            try {
+                Import-Module ADFS -ErrorAction Stop
+                $ADFSInstalled = $true
+            }
+            catch {
+                $ADFSInstalled = $false
+            }
+            
+            if ($ADFSInstalled) {
+                try {
+                    $RelyingParties = Get-AdfsRelyingPartyTrust -ErrorAction Stop
+                    
+                    if ($RelyingParties) {
+                        foreach ($RP in $RelyingParties) {
+                            # Get identifier (usually the first one is primary)
+                            $Identifier = if ($RP.Identifier) { 
+                                ($RP.Identifier | Select-Object -First 1) 
+                            } else { 
+                                "Not Set" 
+                            }
+                            
+                            # Get endpoint count
+                            $EndpointCount = if ($RP.SamlEndpoints) { 
+                                $RP.SamlEndpoints.Count 
+                            } else { 
+                                0 
+                            }
+                            
+                            # Get primary endpoint
+                            $PrimaryEndpoint = if ($RP.SamlEndpoints -and $RP.SamlEndpoints.Count -gt 0) {
+                                $RP.SamlEndpoints[0].Location
+                            } else {
+                                "No Endpoints"
+                            }
+                            
+                            # Get encryption certificate info
+                            $EncryptionCert = if ($RP.EncryptionCertificate) {
+                                $CertThumb = $RP.EncryptionCertificate.Thumbprint
+                                "Present ($($CertThumb.Substring(0, 16))...)"
+                            } else {
+                                "None"
+                            }
+                            
+                            # Get signing certificate info
+                            $SigningCert = if ($RP.RequestSigningCertificate -and $RP.RequestSigningCertificate.Count -gt 0) {
+                                $CertThumb = $RP.RequestSigningCertificate[0].Thumbprint
+                                "Present ($($CertThumb.Substring(0, 16))...)"
+                            } else {
+                                "None"
+                            }
+                            
+                            # Get claims rules count
+                            $IssuanceRules = if ($RP.IssuanceTransformRules) {
+                                ($RP.IssuanceTransformRules -split 'c:\[Type').Count - 1
+                            } else {
+                                0
+                            }
+                            
+                            $AuthorizationRules = if ($RP.IssuanceAuthorizationRules) {
+                                ($RP.IssuanceAuthorizationRules -split 'c:\[Type').Count - 1
+                            } else {
+                                0
+                            }
+                            
+                            # Token lifetime
+                            $TokenLifetime = if ($RP.TokenLifetime) {
+                                "$($RP.TokenLifetime) minutes"
+                            } else {
+                                "Default"
+                            }
+                            
+                            # Monitoring status
+                            $MonitoringEnabled = if ($RP.MonitoringEnabled) { "Yes" } else { "No" }
+                            
+                            # Auto update status
+                            $AutoUpdate = if ($RP.AutoUpdateEnabled) { "Enabled" } else { "Disabled" }
+                            
+                            # Determine overall status
+                            $Status = if ($RP.Enabled) {
+                                if ($IssuanceRules -gt 0) {
+                                    "Active"
+                                } else {
+                                    "Enabled (No Rules)"
+                                }
+                            } else {
+                                "Disabled"
+                            }
+                            
+                            $Results.RelyingPartyTrusts += [PSCustomObject]@{
+                                Name = $RP.Name
+                                Enabled = if ($RP.Enabled) { "Yes" } else { "No" }
+                                Identifier = $Identifier
+                                EndpointCount = $EndpointCount
+                                PrimaryEndpoint = $PrimaryEndpoint
+                                EncryptionCertificate = $EncryptionCert
+                                SigningCertificate = $SigningCert
+                                IssuanceRules = $IssuanceRules
+                                AuthorizationRules = $AuthorizationRules
+                                TokenLifetime = $TokenLifetime
+                                AutoUpdate = $AutoUpdate
+                                MonitoringEnabled = $MonitoringEnabled
+                                Status = $Status
+                            }
+                        }
+                        
+                        # Add summary row
+                        $EnabledCount = ($RelyingParties | Where-Object { $_.Enabled }).Count
+                        $DisabledCount = ($RelyingParties | Where-Object { -not $_.Enabled }).Count
+                        
+                        $Results.RelyingPartyTrusts += [PSCustomObject]@{
+                            Name = "SUMMARY"
+                            Enabled = ""
+                            Identifier = ""
+                            EndpointCount = ""
+                            PrimaryEndpoint = ""
+                            EncryptionCertificate = ""
+                            SigningCertificate = ""
+                            IssuanceRules = ""
+                            AuthorizationRules = ""
+                            TokenLifetime = ""
+                            AutoUpdate = ""
+                            MonitoringEnabled = ""
+                            Status = "Total: $($RelyingParties.Count) | Enabled: $EnabledCount | Disabled: $DisabledCount"
+                        }
+                    }
+                    else {
+                        $Results.RelyingPartyTrusts += [PSCustomObject]@{
+                            Name = "No Relying Party Trusts Found"
+                            Enabled = ""
+                            Identifier = ""
+                            EndpointCount = ""
+                            PrimaryEndpoint = ""
+                            EncryptionCertificate = ""
+                            SigningCertificate = ""
+                            IssuanceRules = ""
+                            AuthorizationRules = ""
+                            TokenLifetime = ""
+                            AutoUpdate = ""
+                            MonitoringEnabled = ""
+                            Status = "None Configured"
+                        }
+                    }
+                }
+                catch {
+                    $Results.RelyingPartyTrusts += [PSCustomObject]@{
+                        Name = "Error retrieving Relying Party Trusts"
+                        Enabled = ""
+                        Identifier = $_.Exception.Message
+                        EndpointCount = ""
+                        PrimaryEndpoint = ""
+                        EncryptionCertificate = ""
+                        SigningCertificate = ""
+                        IssuanceRules = ""
+                        AuthorizationRules = ""
+                        TokenLifetime = ""
+                        AutoUpdate = ""
+                        MonitoringEnabled = ""
+                        Status = "Failed"
+                    }
+                }
+            }
+            else {
+                $Results.RelyingPartyTrusts += [PSCustomObject]@{
+                    Name = "ADFS Module Not Available"
+                    Enabled = ""
+                    Identifier = "Cannot retrieve Relying Party Trusts without ADFS PowerShell module"
+                    EndpointCount = ""
+                    PrimaryEndpoint = ""
+                    EncryptionCertificate = ""
+                    SigningCertificate = ""
+                    IssuanceRules = ""
+                    AuthorizationRules = ""
+                    TokenLifetime = ""
+                    AutoUpdate = ""
+                    MonitoringEnabled = ""
+                    Status = "Module Missing"
+                }
+            }
+        }
+        catch {
+            $Results.RelyingPartyTrusts += [PSCustomObject]@{
+                Name = "Error"
+                Enabled = ""
+                Identifier = $_.Exception.Message
+                EndpointCount = ""
+                PrimaryEndpoint = ""
+                EncryptionCertificate = ""
+                SigningCertificate = ""
+                IssuanceRules = ""
+                AuthorizationRules = ""
+                TokenLifetime = ""
+                AutoUpdate = ""
+                MonitoringEnabled = ""
                 Status = "Failed"
             }
         }
@@ -5161,8 +5620,22 @@ function Show-ExchangeResults {
                     $NetGrid.DataSource = [System.Collections.ArrayList]$Data.InternetAccess
                     $NetGrid.Add_DataBindingComplete({
                         foreach ($Row in $NetGrid.Rows) {
-                            if ($Row.Cells["Status"].Value -eq "OK") { $Row.DefaultCellStyle.BackColor = $Script:Colors.Success }
-                            else { $Row.DefaultCellStyle.BackColor = $Script:Colors.Error }
+                            $Status = $Row.Cells["Status"].Value
+                            if ($Status -eq "OK") { 
+                                $Row.DefaultCellStyle.BackColor = $Script:Colors.Success 
+                            }
+                            elseif ($Status -eq "WARNING") { 
+                                $Row.DefaultCellStyle.BackColor = $Script:Colors.Warning 
+                            }
+                            elseif ($Status -eq "INFO") { 
+                                $Row.DefaultCellStyle.BackColor = $Script:Colors.Info 
+                            }
+                            elseif ($Status -eq "SECURITY RISK") { 
+                                $Row.DefaultCellStyle.BackColor = $Script:Colors.Error 
+                            }
+                            else { 
+                                $Row.DefaultCellStyle.BackColor = $Script:Colors.Error 
+                            }
                         }
                     })
                     $NetTab.Controls.Add($NetGrid)
@@ -5345,7 +5818,46 @@ function Show-ADResults {
                         $Grid = New-ResultDataGrid -Title $Category.Name
                         $Grid.DataSource = [System.Collections.ArrayList]$Data[$Category.Key]
                         
-                        if ($Category.ColorCode) {
+                        # SPECIAL HANDLING FOR REPLICATION
+                        if ($Category.Key -eq "Replication") {
+                            $Grid.Add_DataBindingComplete({
+                                foreach ($Row in $Grid.Rows) {
+                                    $StatusValue = $Row.Cells["Status"].Value
+                                    
+                                    # Color coding based on status
+                                    if ($StatusValue -eq "OK") {
+                                        $Row.DefaultCellStyle.BackColor = $Script:Colors.Success
+                                    }
+                                    elseif ($StatusValue -eq "WARNING") {
+                                        $Row.DefaultCellStyle.BackColor = $Script:Colors.Warning
+                                    }
+                                    elseif ($StatusValue -match "ERROR|CRITICAL|FAILED") {
+                                        $Row.DefaultCellStyle.BackColor = $Script:Colors.Error
+                                    }
+                                    elseif ($StatusValue -match "INFO|INVENTORY|COMPLETE") {
+                                        $Row.DefaultCellStyle.BackColor = $Script:Colors.Info
+                                    }
+                                    elseif ($StatusValue -eq "DC_HEADER") {
+                                        $Row.DefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(52, 73, 94)
+                                        $Row.DefaultCellStyle.ForeColor = [System.Drawing.Color]::White
+                                        $Row.DefaultCellStyle.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+                                    }
+                                    elseif ($StatusValue -eq "") {
+                                        $Row.DefaultCellStyle.BackColor = [System.Drawing.Color]::White
+                                        $Row.Height = 5
+                                    }
+                                    
+                                    # Make header rows taller and bold
+                                    $DCName = $Row.Cells["DCName"].Value
+                                    if ($DCName -match "^=|^\[===|INVENTORY|STATUS|COMPLETE") {
+                                        $Row.DefaultCellStyle.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+                                        $Row.Height = 35
+                                    }
+                                }
+                            })
+                        }
+                        # STANDARD COLOR CODING FOR OTHER CATEGORIES
+                        elseif ($Category.ColorCode) {
                             $Grid.Add_DataBindingComplete({
                                 foreach ($Row in $Grid.Rows) {
                                     $StatusCell = $Row.Cells | Where-Object { $_.OwningColumn.Name -eq "Status" -or $_.OwningColumn.Name -eq "Result" }
@@ -5502,6 +6014,7 @@ function Show-ADFSResults {
                     @{Name="MFA Configuration"; Key="MFAConfiguration"; ColorCode=$true},
                     @{Name="ADFS Properties"; Key="ADFSProperties"; ColorCode=$false},
                     @{Name="Farm Information"; Key="FarmInformation"; ColorCode=$false}
+                    @{Name="Relying Party Trusts"; Key="RelyingPartyTrusts"; ColorCode=$true}
                 )
                 
                 foreach ($Category in $Categories) {
@@ -5999,10 +6512,10 @@ function Export-ValidationCSV {
             $CSVFileName = "${ValidationType}-${SafeServerName}-${Timestamp}.csv"
             $CSVPath = Join-Path $OutputPath $CSVFileName
             
-            # ✅ SIMPLE CSV FORMAT - No special characters
+            # Simple CSV format
             $CSVData = @()
             
-            # Report Header (using simple dashes)
+            # Report Header
             $CSVData += [PSCustomObject]@{
                 'Category' = '========================================='
                 'Item' = ''
@@ -6010,8 +6523,18 @@ function Export-ValidationCSV {
                 'Status' = ''
             }
             
+            # Validation type display
+            $ValidationDisplayName = switch ($ValidationType) {
+                "Exchange" { "EXCHANGE SERVER VALIDATION REPORT" }
+                "ActiveDirectory" { "ACTIVE DIRECTORY VALIDATION REPORT" }
+                "ADFS" { "ADFS VALIDATION REPORT" }
+                "AzureADConnect" { "AZURE AD CONNECT VALIDATION REPORT" }
+                "Utilization" { "SYSTEM UTILIZATION VALIDATION REPORT" }
+                default { "INFRASTRUCTURE VALIDATION REPORT" }
+            }
+            
             $CSVData += [PSCustomObject]@{
-                'Category' = 'INFRASTRUCTURE VALIDATION REPORT'
+                'Category' = $ValidationDisplayName
                 'Item' = ''
                 'Details' = ''
                 'Status' = ''
@@ -6077,7 +6600,7 @@ function Export-ValidationCSV {
             foreach ($Category in $Results.Keys | Sort-Object) {
                 if ($Results[$Category] -and $Results[$Category].Count -gt 0) {
                     
-                    # Category Header (simple dashes)
+                    # Category Header
                     $CSVData += [PSCustomObject]@{
                         'Category' = '-----------------------------------------'
                         'Item' = ''
@@ -6085,9 +6608,12 @@ function Export-ValidationCSV {
                         'Status' = ''
                     }
                     
+                    $ItemCount = $Results[$Category].Count
+                    $ItemCountText = $ItemCount.ToString() + " items"
+                    
                     $CSVData += [PSCustomObject]@{
                         'Category' = $Category.ToUpper()
-                        'Item' = "($($Results[$Category].Count) items)"
+                        'Item' = $ItemCountText
                         'Details' = ''
                         'Status' = ''
                     }
@@ -6109,7 +6635,8 @@ function Export-ValidationCSV {
                         $StatusValue = ""
                         
                         # Get primary identifier
-                        foreach ($KeyProp in @("Name", "ServiceName", "Metric", "Property", "Component", "Check", "DatabaseName", "GPOName", "ConnectorName", "Feature", "Setting", "RunDate")) {
+                        $KeyProps = @("Name", "ServiceName", "Metric", "Property", "Component", "Check", "DatabaseName", "GPOName", "ConnectorName", "Feature", "Setting", "RunDate")
+                        foreach ($KeyProp in $KeyProps) {
                             if ($Properties.Name -contains $KeyProp -and -not [string]::IsNullOrWhiteSpace($Item.$KeyProp)) {
                                 $ItemName = $Item.$KeyProp
                                 break
@@ -6117,7 +6644,8 @@ function Export-ValidationCSV {
                         }
                         
                         # Get status
-                        foreach ($StatusProp in @("Status", "State", "Result", "StatusCode")) {
+                        $StatusProps = @("Status", "State", "Result", "StatusCode")
+                        foreach ($StatusProp in $StatusProps) {
                             if ($Properties.Name -contains $StatusProp -and -not [string]::IsNullOrWhiteSpace($Item.$StatusProp)) {
                                 $StatusValue = $Item.$StatusProp
                                 break
@@ -6137,11 +6665,12 @@ function Export-ValidationCSV {
                                 $PropName = $PropName -replace 'DisplayName', 'Display'
                                 $PropName = $PropName -replace 'Description', 'Desc'
                                 
-                                $DetailParts += "$PropName`: $PropValue"
+                                $DetailParts += "$PropName : $PropValue"
                             }
                         }
                         
-                        $Details = $DetailParts -join " | "
+                        $Separator = " | "
+                        $Details = $DetailParts -join $Separator
                         
                         # Fallback for item name
                         if ([string]::IsNullOrWhiteSpace($ItemName)) {
@@ -6218,7 +6747,8 @@ function Export-ValidationCSV {
                 $ExportedFiles += $CSVPath
             }
             catch {
-                Write-Warning "Failed to export data for $ServerName $($_.Exception.Message)"
+                $ErrorMsg = "Failed to export data for " + $ServerName + " - " + $_.Exception.Message
+                Write-Warning $ErrorMsg
             }
         }
         
@@ -6232,7 +6762,8 @@ function Export-ValidationCSV {
             foreach ($File in $ExportedFiles) {
                 $FileInfo = Get-Item $File
                 $FileSizeKB = [math]::Round($FileInfo.Length / 1KB, 2)
-                $Message += "- $(Split-Path $File -Leaf) ($FileSizeKB KB)`n"
+                $FileName = Split-Path $File -Leaf
+                $Message += "- $FileName ($FileSizeKB KB)`n"
             }
             
             $Message += "`nOpen the Reports folder now?"
@@ -6301,8 +6832,23 @@ function Show-ExportDialog {
     $TitleLabel.Size = New-Object System.Drawing.Size(500, 40)
     $ExportForm.Controls.Add($TitleLabel)
     
+    # Determine what validation data is loaded
+    $FirstServerData = $Script:CurrentResults.Values | Select-Object -First 1
+    $ValidationType = if ($FirstServerData) { 
+        switch ($FirstServerData.Type) {
+            "Exchange" { "Exchange Server" }
+            "ActiveDirectory" { "Active Directory" }
+            "ADFS" { "ADFS" }
+            "AzureADConnect" { "Azure AD Connect" }
+            "Utilization" { "System Utilization" }
+            default { "Infrastructure" }
+        }
+    } else { 
+        "Infrastructure" 
+    }
+
     $SubtitleLabel = New-Object System.Windows.Forms.Label
-    $SubtitleLabel.Text = "Choose how you want to export your validation data"
+    $SubtitleLabel.Text = "Export $ValidationType validation results"
     $SubtitleLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10)
     $SubtitleLabel.ForeColor = [System.Drawing.Color]::FromArgb(96, 94, 92)
     $SubtitleLabel.Location = New-Object System.Drawing.Point(30, 70)
@@ -6502,6 +7048,11 @@ function Sanitize-HTMLContent {
         return ""
     }
     
+    # NEW: Remove dangerous script elements
+    $Content = $Content -replace '<script[^>]*>.*?</script>', ''
+    $Content = $Content -replace 'javascript:', ''
+    $Content = $Content -replace 'on\w+\s*=', ''
+    
     # Basic HTML encoding - escape each character individually
     $Content = $Content -replace '&', '&amp;'
     $Content = $Content -replace '<', '&lt;'
@@ -6522,7 +7073,7 @@ function Generate-HTMLReport {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Infrastructure Validation Report</title>
+    <title>VALIDATION_TYPE_TEXT - Infrastructure Validation Report</title>
     <style>
         * {
             margin: 0;
@@ -6551,6 +7102,20 @@ function Generate-HTMLReport {
             background: linear-gradient(135deg, #1877F2 0%, #0A66C2 100%);
             color: #FFFFFF;
             padding: 40px 50px;
+        }
+
+        .validation-type-badge {
+            display: inline-block;
+            background: rgba(255, 255, 255, 0.25);
+            color: #FFFFFF;
+            padding: 8px 20px;
+            border-radius: 20px;
+            font-size: 13px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            margin: 10px 0 15px 0;
+            border: 2px solid rgba(255, 255, 255, 0.4);
         }
         
         .header h1 {
@@ -6844,6 +7409,7 @@ function Generate-HTMLReport {
         <div class="header">
             <div class="header-content">
                 <h1>Infrastructure Validation Report</h1>
+                <div class="validation-type-badge">VALIDATION_TYPE_BADGE</div>
                 <div class="subtitle">Comprehensive System Health Assessment &amp; Documentation</div>
                 
                 <div class="meta-info">
@@ -6901,6 +7467,24 @@ SERVER_CONTENT
     $HTML = $HTML -replace 'REPORT_TIME', (Get-Date -Format 'HH:mm:ss')
     $HTML = $HTML -replace 'TOTAL_SERVERS', $Results.Keys.Count
     
+    # Determine validation type from first server's data
+    $FirstServerData = $Results.Values | Select-Object -First 1
+    $ValidationType = if ($FirstServerData) { $FirstServerData.Type } else { "Mixed" }
+
+    # Create readable validation name
+    $ValidationDisplayName = switch ($ValidationType) {
+        "Exchange" { "EXCHANGE SERVER VALIDATION" }
+        "ActiveDirectory" { "ACTIVE DIRECTORY VALIDATION" }
+        "ADFS" { "ADFS VALIDATION" }
+        "AzureADConnect" { "AZURE AD CONNECT VALIDATION" }
+        "Utilization" { "SYSTEM UTILIZATION VALIDATION" }
+        default { "INFRASTRUCTURE VALIDATION" }
+    }
+
+    # Replace validation type placeholders
+    $HTML = $HTML -replace 'VALIDATION_TYPE_BADGE', $ValidationDisplayName
+    $HTML = $HTML -replace 'VALIDATION_TYPE_TEXT', $ValidationDisplayName
+
     # Generate TOC
     $TOCContent = ""
     foreach ($ServerName in $Results.Keys | Sort-Object) {
